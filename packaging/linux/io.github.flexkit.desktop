@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=ChromeOS Flex Installer
+GenericName=USB Installer Creator
+Comment=Download ChromeOS Flex and create a bootable USB installer
+Exec=flexkit
+Icon=io.github.flexkit
+Terminal=false
+Categories=System;Utility;
+StartupNotify=true
+StartupWMClass=io.github.flexkit

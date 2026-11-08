@@ -1,0 +1,35 @@
+# Bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Build & distribution outputs
+build/
+dist/
+*.build/
+*.dist/
+*.onefile-build/
+*.spec
+
+# Partial / test image artifacts
+*.bin
+*.img
+*.zip
+*.part
+*.part.json
+*.aria2
+
+# OS & editor metadata
+.DS_Store
+Thumbs.db
+*~
+*.swp
