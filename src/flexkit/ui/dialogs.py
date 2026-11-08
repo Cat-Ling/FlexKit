@@ -6,6 +6,7 @@ from flexkit.drives import Drive
 from flexkit.ui import theme
 from flexkit.ui.qt import QRectF, QTimer, Qt, QtCore, QtGui, QtWidgets
 from flexkit.ui.widgets import BadgeIcon, Banner, DestructiveButton, FilledButton, TextButton
+from flexkit.writer.gpt import ChromeOSBootOptions
 
 
 class _CardFrame(QtWidgets.QFrame):
@@ -102,6 +103,7 @@ def confirm_write_dialog(
     image: PreparedImage | Release,
     drive: Drive,
     install_mode: str = "installer",
+    boot_options: ChromeOSBootOptions | None = None,
 ) -> bool:
     sheet = ScrimSheet(host)
     lay = sheet.card_layout
@@ -162,6 +164,16 @@ def confirm_write_dialog(
         hdd_warn = Banner("warning", sheet.card)
         hdd_warn.show_message("This is a USB hard drive, not a flash drive.")
         lay.addWidget(hdd_warn)
+
+    if boot_options and boot_options.force_legacy_boot:
+        legacy_warn = Banner("warning", sheet.card)
+        if not boot_options.disable_auto_updates:
+            legacy_warn.show_message(
+                "Force Legacy Boot is enabled with auto-updates on. Older BIOS PCs may experience regressions after future ChromeOS updates."
+            )
+        else:
+            legacy_warn.show_message("Force Legacy Boot is enabled. Drive will boot via Legacy BIOS / CSM.")
+        lay.addWidget(legacy_warn)
 
     if is_update:
         warn_txt = QtWidgets.QLabel(

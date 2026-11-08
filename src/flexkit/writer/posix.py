@@ -151,6 +151,7 @@ def write_block_device(
             timeout=spec.timeout,
             nomodeset=spec.nomodeset,
             unencrypted_stateful=spec.unencrypted_stateful,
+            force_legacy_boot=spec.force_legacy_boot,
         )
     finally:
         logger.info("Closing block device fd=%d", wfd)

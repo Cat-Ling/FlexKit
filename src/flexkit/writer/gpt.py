@@ -24,6 +24,19 @@ CHROMEOS_RESERVED_TYPE = uuid.UUID("2e0a753d-9e48-43b0-8337-b15192cb1b5e")
 ROOT_A_UNIQUE_UUID = uuid.UUID("fdecd5e5-f2f2-ce47-852b-3839e867212b")
 ROOT_B_UNIQUE_UUID = uuid.UUID("c99b551e-01ac-7345-864f-a9fdbd74f6c1")
 
+CHROMEOS_HYBRID_MBR_CODE = (
+    b"3\xc0\xfa\x8e\xd8\x8e\xd0\xbc\x00|\x89\xe6\x06W\x8e\xc0\xfb\xfc\xbf\x00\x06\xb9\x00\x01\xf3\xa5\xea\x1f\x06\x00\x00"
+    b"R\x89\xe5\x83\xec\x1cj\x1e\xc7F\xfa\x00\x02R\xb4A\xbb\xaaU1\xc90\xf6\xf9\xcd\x13Z\xb4\x08r\x17\x81\xfbU\xaau\x11"
+    b"\xd1\xe9s\rf\xc7\x06Y\x07\xb4B\xeb\x13\xb4H\x89\xe6\xcd\x13\x83\xe1?Q\x0f\xb6\xc6@\xf7\xe1RPf1\xc0f\x99@\xe8\xdc\x00"
+    b"\x8bNV\x8bFZPQ\xf7\xe1\xf7v\xfa\x91Af\x8bFNf\x8bVRS\xe8\xc4\x00\xe2\xfb1\xf6_YXf\x8b\x15f\x0bU\x04f\x0bU\x08f\x0bU\x0c"
+    b"t\x0c\xf6E0\x04t\x06!\xf6u\x19\x89\xfe\x01\xc7\xe2\xdf!\xf6u.\xe8\xe1\x00Missing OS\r\n\xe8\xd2\x00Multiple active partitions\r\n"
+    b"\x91\xbf\xbe\x07Wf1\xc0\xb0\x80f\xab\xb0\xedf\xabf\x8bD f\x8bT$\xe8@\x00f\x8bD(f\x8bT,f+D f\x1bT$\xe8p\x00\xe8*\x00"
+    b"f\x0f\xb7\xc1f\xab\xf3\xa4^f\x8bD4f\x8bT8\xe8\"\x00\x81>\xfe}U\xaau\x85\x89\xecZ_\x07f\xb8!GPT\xfa\xff\xe4f!\xd2t\x04"
+    b"f\x83\xc8\xfff\xab\xc3\xbb\x00|f`fRfP\x06Sj\x01j\x10\x89\xe6f\xf7v\xdc\xc0\xe4\x06\x88\xe1\x88\xc5\x92\xf6v\xe0\x88\xc6"
+    b"\x08\xe1A\xb8\x01\x02\x8aV\x00\xcd\x13\x8dd\x10far\x0c\x02~\xfbf\x83\xc0\x01f\x83\xd2\x00\xc3\xe8\x0c\x00Disk error\r\n"
+    b"^\xac\xb4\x0e\x8a>b\x04\xb3\x07\xcd\x10<\nu\xf1\xcd\xe7\xb5\x8d\x0bz\x0bE\x1c\xad\x8d \x01\xa3\x8f\x7f\xb7\xa8~C\xba\x00\x00"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class GptPartition:
@@ -76,6 +89,7 @@ class ChromeOSBootOptions:
     timeout: int = 2
     nomodeset: bool = False
     unencrypted_stateful: bool = False
+    force_legacy_boot: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -85,6 +99,7 @@ class ChromeOSBootOptions:
             "timeout": self.timeout,
             "nomodeset": self.nomodeset,
             "unencrypted_stateful": self.unencrypted_stateful,
+            "force_legacy_boot": self.force_legacy_boot,
         }
 
     @classmethod
@@ -96,6 +111,7 @@ class ChromeOSBootOptions:
             timeout=int(data.get("timeout") or 2),
             nomodeset=bool(data.get("nomodeset")),
             unencrypted_stateful=bool(data.get("unencrypted_stateful")),
+            force_legacy_boot=bool(data.get("force_legacy_boot")),
         )
 
 
@@ -172,10 +188,36 @@ def is_chromeos_drive(path_or_device: Path | str) -> bool:
         return False
 
 
-def build_protective_mbr(total_sectors: int) -> bytes:
+def build_protective_mbr(
+    total_sectors: int,
+    boot_code: bytes | None = None,
+    efi_lba: int = 299008,
+    efi_sectors: int = 524288,
+) -> bytes:
     mbr = bytearray(SECTOR_SIZE)
-    sectors = min(total_sectors - 1, 0xFFFFFFFF)
-    mbr[446:462] = struct.pack("<BBBBBBBBII", 0, 0, 2, 0, 0xEE, 0xFF, 0xFF, 0xFF, 1, sectors)
+    code = boot_code if boot_code is not None else CHROMEOS_HYBRID_MBR_CODE
+    mbr[: min(len(code), 446)] = code[:446]
+
+    # Entry 1: Partition 12 (EFI-SYSTEM), active/bootable for Syslinux legacy boot
+    mbr[446:462] = struct.pack(
+        "<BBBBBBBBII",
+        0x80,
+        0, 0, 0,
+        0x0C,
+        0xFF, 0xFF, 0xFF,
+        efi_lba,
+        efi_sectors,
+    )
+    # Entry 2: GPT protective entry covering disk
+    mbr[462:478] = struct.pack(
+        "<BBBBBBBBII",
+        0x00,
+        0, 2, 0,
+        0xEE,
+        0xFF, 0xFF, 0xFF,
+        1,
+        1,
+    )
     mbr[510:512] = b"\x55\xAA"
     return bytes(mbr)
 
@@ -379,6 +421,8 @@ def read_chromeos_boot_options(path_or_device: Path | str) -> ChromeOSBootOption
                 if b".force_unencrypted_stateful" in state_chunk or b"encstateful_mount_option" in state_chunk:
                     unenc = True
 
+            is_legacy_forced = (efi_chunk.find(b"BOOTX64 DIS") != -1 or efi_chunk.find(b"BOOTX64.DIS") != -1)
+
             return ChromeOSBootOptions(
                 cros_debug=opts.cros_debug,
                 disable_auto_updates=disable_au,
@@ -386,6 +430,7 @@ def read_chromeos_boot_options(path_or_device: Path | str) -> ChromeOSBootOption
                 timeout=opts.timeout,
                 nomodeset=opts.nomodeset,
                 unencrypted_stateful=unenc,
+                force_legacy_boot=is_legacy_forced,
             )
     except (OSError, PermissionError):
         return None
@@ -459,6 +504,35 @@ def patch_grub_in_block_device(
         if len(patched_bytes) < orig_len:
             patched_bytes = patched_bytes + (b" " * (orig_len - len(patched_bytes)))
         os.pwrite(fd, patched_bytes, write_off)
+
+        # Force legacy boot toggle: disable or re-enable BOOTX64.EFI and BOOTIA32.EFI
+        bootx64_idx = chunk.find(b"BOOTX64 EFI")
+        bootx64_dis_idx = chunk.find(b"BOOTX64 DIS")
+        if options.force_legacy_boot:
+            if bootx64_idx != -1:
+                os.pwrite(fd, b"DIS", efi_base_bytes + bootx64_idx + 8)
+                lfn_ext = chunk.rfind(b"e\x00f\x00i\x00", max(0, bootx64_idx - 64), bootx64_idx)
+                if lfn_ext != -1:
+                    os.pwrite(fd, b"d\x00i\x00s\x00", efi_base_bytes + lfn_ext)
+            boot32_idx = chunk.find(b"BOOTIA32EFI")
+            if boot32_idx != -1:
+                os.pwrite(fd, b"DIS", efi_base_bytes + boot32_idx + 8)
+                lfn32 = chunk.rfind(b"e\x00f\x00i\x00", max(0, boot32_idx - 64), boot32_idx)
+                if lfn32 != -1:
+                    os.pwrite(fd, b"d\x00i\x00s\x00", efi_base_bytes + lfn32)
+        else:
+            if bootx64_dis_idx != -1:
+                os.pwrite(fd, b"EFI", efi_base_bytes + bootx64_dis_idx + 8)
+                lfn_dis = chunk.rfind(b"d\x00i\x00s\x00", max(0, bootx64_dis_idx - 64), bootx64_dis_idx)
+                if lfn_dis != -1:
+                    os.pwrite(fd, b"e\x00f\x00i\x00", efi_base_bytes + lfn_dis)
+            boot32_dis_idx = chunk.find(b"BOOTIA32DIS")
+            if boot32_dis_idx != -1:
+                os.pwrite(fd, b"EFI", efi_base_bytes + boot32_dis_idx + 8)
+                lfn32_dis = chunk.rfind(b"d\x00i\x00s\x00", max(0, boot32_dis_idx - 64), boot32_dis_idx)
+                if lfn32_dis != -1:
+                    os.pwrite(fd, b"e\x00f\x00i\x00", efi_base_bytes + lfn32_dis)
+
         os.fsync(fd)
         return True
     except (OSError, PermissionError):

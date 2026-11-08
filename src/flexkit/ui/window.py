@@ -562,6 +562,8 @@ class FlexKitWindow(QtWidgets.QMainWindow):
                     bg_hex=theme.SUCCESS_CONTAINER,
                     fg_hex=theme.SUCCESS,
                 )
+                opts = self.drive_page.boot_options()
+                self.done_page.set_legacy_warning(opts.force_legacy_boot, not opts.disable_auto_updates)
             self._stack.setCurrentWidget(self.done_page)
             self._primary_btn.setText("Done")
 
@@ -694,7 +696,8 @@ class FlexKitWindow(QtWidgets.QMainWindow):
             if drv is None or self._prepared is None:
                 return
             mode = self.drive_page.install_mode()
-            if confirm_write_dialog(self, self._prepared, drv, install_mode=mode):
+            opts = self.drive_page.boot_options()
+            if confirm_write_dialog(self, self._prepared, drv, install_mode=mode, boot_options=opts):
                 self._target_drive = drv
                 self._start_write(drv)
             return
@@ -839,6 +842,7 @@ class FlexKitWindow(QtWidgets.QMainWindow):
             timeout=opts.timeout,
             nomodeset=opts.nomodeset,
             unencrypted_stateful=opts.unencrypted_stateful,
+            force_legacy_boot=opts.force_legacy_boot,
         )
         self.progress_page.reset_indeterminate()
         self._go_to(Step.WRITING)

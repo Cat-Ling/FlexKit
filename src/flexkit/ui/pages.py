@@ -393,6 +393,14 @@ class DrivePage(QtWidgets.QWidget):
         adv_lay.addWidget(self.unencrypted_tile)
         self.unencrypted_cb = self.unencrypted_tile
 
+        self.force_legacy_tile = BootOptionTile(
+            "Force Legacy Boot (BIOS / CSM)",
+            "Disables UEFI crdyboot and forces legacy Syslinux booting. Fixes 'RefCell already borrowed' crashes on 2nd Gen Intel PCs.",
+            parent=self.adv_container,
+        )
+        adv_lay.addWidget(self.force_legacy_tile)
+        self.force_legacy_cb = self.force_legacy_tile
+
         timeout_box = QtWidgets.QFrame(self.adv_container)
         timeout_lay = QtWidgets.QHBoxLayout(timeout_box)
         timeout_lay.setContentsMargins(10, 8, 10, 8)
@@ -491,6 +499,7 @@ class DrivePage(QtWidgets.QWidget):
             timeout=t_val,
             nomodeset=self.nomodeset_tile.isChecked(),
             unencrypted_stateful=self.unencrypted_tile.isChecked(),
+            force_legacy_boot=self.force_legacy_tile.isChecked(),
         )
 
     def verify_drive_checked(self) -> bool:
@@ -502,6 +511,7 @@ class DrivePage(QtWidgets.QWidget):
         self.verbose_tile.setChecked(False)
         self.nomodeset_tile.setChecked(False)
         self.unencrypted_tile.setChecked(False)
+        self.force_legacy_tile.setChecked(False)
         self.timeout_dropdown.set_current_index(1)
 
     def selected_drive(self) -> Drive | None:
@@ -572,6 +582,7 @@ class DrivePage(QtWidgets.QWidget):
                 self.verbose_tile.setChecked(opts.verbose_boot)
                 self.nomodeset_tile.setChecked(opts.nomodeset)
                 self.unencrypted_tile.setChecked(opts.unencrypted_stateful)
+                self.force_legacy_tile.setChecked(opts.force_legacy_boot)
                 t_idx = {0: 0, 2: 1, 5: 2, 10: 3}.get(opts.timeout, 1)
                 self.timeout_dropdown.set_current_index(t_idx)
         else:
@@ -586,6 +597,23 @@ class DrivePage(QtWidgets.QWidget):
 class DonePage(QtWidgets.QWidget):
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
-        lay = QtWidgets.QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(OobeIllustration("done", self), 1)
+        self._lay = QtWidgets.QVBoxLayout(self)
+        self._lay.setContentsMargins(0, 0, 0, 0)
+        self._lay.setSpacing(12)
+        self._lay.addWidget(OobeIllustration("done", self), 1)
+
+        self.legacy_banner = Banner("warning", self)
+        self.legacy_banner.setVisible(False)
+        self._lay.addWidget(self.legacy_banner, 0, Qt.AlignmentFlag.AlignHCenter)
+
+    def set_legacy_warning(self, legacy_forced: bool, auto_updates_enabled: bool) -> None:
+        if legacy_forced:
+            if auto_updates_enabled:
+                self.legacy_banner.show_message(
+                    "Legacy Boot Mode enabled. If auto-updates remain on, keep an eye on future ChromeOS updates on older BIOS hardware."
+                )
+            else:
+                self.legacy_banner.show_message("Legacy Boot Mode enabled. Boot your PC using Legacy BIOS / CSM mode.")
+            self.legacy_banner.setVisible(True)
+        else:
+            self.legacy_banner.setVisible(False)

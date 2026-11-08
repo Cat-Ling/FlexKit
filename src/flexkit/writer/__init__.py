@@ -65,6 +65,7 @@ class WriteSpec:
     timeout: int = 2
     nomodeset: bool = False
     unencrypted_stateful: bool = False
+    force_legacy_boot: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -83,6 +84,7 @@ class WriteSpec:
             "timeout": self.timeout,
             "nomodeset": self.nomodeset,
             "unencrypted_stateful": self.unencrypted_stateful,
+            "force_legacy_boot": self.force_legacy_boot,
         }
 
     @classmethod
@@ -103,6 +105,7 @@ class WriteSpec:
             timeout=int(d.get("timeout") or 2),
             nomodeset=bool(d.get("nomodeset", False)),
             unencrypted_stateful=bool(d.get("unencrypted_stateful", False)),
+            force_legacy_boot=bool(d.get("force_legacy_boot", False)),
         )
 
 
@@ -167,6 +170,7 @@ def stream_zip_to_fd(
     timeout: int = 2,
     nomodeset: bool = False,
     unencrypted_stateful: bool = False,
+    force_legacy_boot: bool = False,
 ) -> None:
     write_sha1 = hashlib.sha1()
     written = 0
@@ -193,7 +197,16 @@ def stream_zip_to_fd(
     if install_mode == "to_go_fresh" and expected_size > 0:
         total_sectors = expected_size // SECTOR_SIZE
         logger.info("Generating ChromeOS To-Go fresh GPT for total_sectors=%d", total_sectors)
-        mbr = build_protective_mbr(total_sectors)
+        boot_code = None
+        try:
+            with open_image_source(archive_path, member_name, image_size) as peek_src:
+                first_sector = peek_src.read(SECTOR_SIZE)
+                if len(first_sector) >= 446 and any(b != 0 for b in first_sector[:446]):
+                    boot_code = first_sector[:446]
+        except Exception as exc:
+            logger.warning("Could not peek source archive MBR: %s", exc)
+
+        mbr = build_protective_mbr(total_sectors, boot_code=boot_code)
         parts = generate_chromeos_togo_partitions(total_sectors)
         primary_hdr, entries, backup_hdr = serialize_gpt(total_sectors, parts)
 
@@ -274,6 +287,7 @@ def stream_zip_to_fd(
         or nomodeset
         or (timeout != 2)
         or unencrypted_stateful
+        or force_legacy_boot
     )
     if has_custom_boot or is_togo:
         boot_opts = ChromeOSBootOptions(
@@ -283,6 +297,7 @@ def stream_zip_to_fd(
             timeout=timeout,
             nomodeset=nomodeset,
             unencrypted_stateful=unencrypted_stateful,
+            force_legacy_boot=force_legacy_boot,
         )
         patch_grub_in_block_device(write_fd, boot_opts)
 

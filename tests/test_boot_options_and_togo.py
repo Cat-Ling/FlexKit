@@ -119,6 +119,15 @@ def test_generate_chromeos_togo_partitions_and_serialize_gpt() -> None:
     mbr = build_protective_mbr(total_sectors)
     assert len(mbr) == 512
     assert mbr[510:512] == b"\x55\xaa"
+    # Verify Hybrid MBR entries
+    status1, ptype1, lba1, secs1 = struct.unpack_from("<B3xB3xII", mbr, 446)
+    assert status1 == 0x80  # Active partition for legacy Syslinux
+    assert ptype1 == 0x0C  # FAT32 LBA
+    assert lba1 == 299008  # EFI-SYSTEM partition
+    status2, ptype2 = struct.unpack_from("<B3xB", mbr, 462)
+    assert status2 == 0x00
+    assert ptype2 == 0xEE  # GPT protective
+    assert any(b != 0 for b in mbr[:446])  # Syslinux MBR code present
 
     pri_hdr, entries, bak_hdr = serialize_gpt(total_sectors, parts)
     assert len(pri_hdr) == 512
@@ -154,15 +163,21 @@ def test_patch_grub_in_block_device_and_read(tmp_path: Path) -> None:
         efi_base = 299008 * 512
         f.seek(efi_base + 634880)
         f.write(SAMPLE_GRUB_CFG.encode("utf-8"))
+        # Place FAT directory entry for BOOTX64 EFI
+        f.seek(efi_base + 290900)
+        f.write(b"e\x00f\x00i\x00")
+        f.seek(efi_base + 290912)
+        f.write(b"BOOTX64 EFI")
 
     # Verify options before patch
     opts_before = read_chromeos_boot_options(img_path)
     assert opts_before is not None
     assert opts_before.cros_debug is False
     assert opts_before.timeout == 2
+    assert opts_before.force_legacy_boot is False
 
-    # Patch boot options in the disk image
-    target_opts = ChromeOSBootOptions(cros_debug=True, verbose_boot=True, timeout=10, nomodeset=True)
+    # Patch boot options with force_legacy_boot=True
+    target_opts = ChromeOSBootOptions(cros_debug=True, verbose_boot=True, timeout=10, nomodeset=True, force_legacy_boot=True)
     ok = patch_grub_in_block_device(img_path, target_opts)
     assert ok is True
 
@@ -173,6 +188,14 @@ def test_patch_grub_in_block_device_and_read(tmp_path: Path) -> None:
     assert opts_after.verbose_boot is True
     assert opts_after.timeout == 10
     assert opts_after.nomodeset is True
+    assert opts_after.force_legacy_boot is True
+
+    # Toggle force_legacy_boot back to False
+    target_opts_restore = ChromeOSBootOptions(force_legacy_boot=False)
+    assert patch_grub_in_block_device(img_path, target_opts_restore) is True
+    opts_restored = read_chromeos_boot_options(img_path)
+    assert opts_restored is not None
+    assert opts_restored.force_legacy_boot is False
 
 
 def test_stream_zip_to_fd_skip_verify(tmp_path: Path) -> None:
