@@ -250,3 +250,84 @@ def test_helper_daemon_session_lifecycle(tmp_path: Path) -> None:
         if proc.poll() is None:
             proc.kill()
 
+
+def test_stream_to_go_fresh_no_sector_size_error(tmp_path: Path) -> None:
+    # Verify to_go_fresh runs without NameError (SECTOR_SIZE) with verify_drive=False and verify_drive=True
+    total_sectors = 6100000
+    expected_size = total_sectors * 512
+
+    # Minimal OS payload data matching CHROMEOS_OS_PAYLOAD_SIZE
+    # We will simulate a small test payload where CHROMEOS_OS_PAYLOAD_SIZE is mocked for speed
+    import flexkit.writer
+    orig_payload_size = flexkit.writer.CHROMEOS_OS_PAYLOAD_SIZE
+    flexkit.writer.CHROMEOS_OS_PAYLOAD_SIZE = 128 * 1024
+
+    try:
+        mock_payload = b"\xaa" * (128 * 1024)
+        zip_path = tmp_path / "flex.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
+            zf.writestr("chromeos.bin", mock_payload)
+
+        dest_path = tmp_path / "mock_drive.img"
+        with open(dest_path, "wb") as f:
+            f.truncate(expected_size)
+
+        wfd = os.open(dest_path, os.O_RDWR)
+        try:
+            # 1. verify_drive=False (the exact condition user reported failing immediately)
+            stream_zip_to_fd(
+                archive_path=zip_path,
+                member_name="chromeos.bin",
+                image_size=len(mock_payload),
+                expected_sha1="",
+                write_fd=wfd,
+                verify_drive=False,
+                install_mode="to_go_fresh",
+                expected_size=expected_size,
+            )
+
+            # 2. verify_drive=True
+            stream_zip_to_fd(
+                archive_path=zip_path,
+                member_name="chromeos.bin",
+                image_size=len(mock_payload),
+                expected_sha1="",
+                write_fd=wfd,
+                verify_drive=True,
+                install_mode="to_go_fresh",
+                expected_size=expected_size,
+            )
+        finally:
+            os.close(wfd)
+
+        # Confirm protective MBR and GPT were written
+        with open(dest_path, "rb") as f:
+            mbr = f.read(512)
+            assert mbr[510:512] == b"\x55\xaa"
+            gpt_hdr = f.read(512)
+            assert gpt_hdr[:8] == b"EFI PART"
+    finally:
+        flexkit.writer.CHROMEOS_OS_PAYLOAD_SIZE = orig_payload_size
+
+
+def test_log_flag_configuration(tmp_path: Path) -> None:
+    import logging
+    from flexkit import configure_logging, get_log_settings, set_log_settings
+
+    log_path = tmp_path / "test_log.txt"
+    lvl, path = set_log_settings("debug", log_path)
+    assert lvl == "DEBUG"
+    assert path == log_path.resolve()
+
+    logger = configure_logging(log_level="DEBUG", log_file=log_path)
+    logger.debug("Test debug message 12345")
+    logger.info("Test info message 67890")
+
+    for h in logger.handlers:
+        h.flush()
+
+    content = log_path.read_text(encoding="utf-8")
+    assert "Test debug message 12345" in content
+    assert "Test info message 67890" in content
+
+

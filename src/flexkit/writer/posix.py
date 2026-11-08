@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import fcntl
+import logging
 import os
 import re
 import subprocess
@@ -9,6 +10,8 @@ import sys
 
 from flexkit.drives import enumerate_all_drives
 from flexkit.writer import WriteError, WriteProgressCallback, WriteSpec, stream_zip_to_fd
+
+logger = logging.getLogger("flexkit.writer.posix")
 
 _VALID_DEV_RE = re.compile(r"^/dev/(sd[a-z]+|mmcblk\d+|disk\d+|da\d+|mmcsd\d+)$")
 _LINUX_BLKRRPART = 0x125F
@@ -104,6 +107,7 @@ def write_block_device(
     if not _VALID_DEV_RE.match(spec.device):
         raise WriteError(f"Invalid target device path: {spec.device!r}")
 
+    logger.info("Unmounting volumes on %s...", spec.device)
     _unmount_target(spec.device)
     io_path = _raw_device_path(spec.device)
 
@@ -111,14 +115,20 @@ def write_block_device(
     if sys.platform.startswith("linux"):
         flags |= os.O_EXCL
 
+    logger.info("Opening %s (io_path=%s) with flags=0x%x...", spec.device, io_path, flags)
     try:
         wfd = os.open(io_path, flags)
     except PermissionError as exc:
+        logger.error("Permission denied opening %s: %s", io_path, exc)
         raise WriteError("Permission denied opening target drive.") from exc
     except OSError as exc:
+        logger.error("Failed to gain exclusive access to %s: %s", io_path, exc)
         raise WriteError(f"Could not gain exclusive access to {spec.device}: {exc}") from exc
 
+    logger.info("Opened %s exclusively as fd=%d", io_path, wfd)
+
     def flush_cache() -> None:
+        logger.info("Flushing block cache on fd=%d (size=%d)...", wfd, spec.image_size)
         _flush_block_cache(wfd, spec.image_size)
 
     try:
@@ -143,6 +153,9 @@ def write_block_device(
             unencrypted_stateful=spec.unencrypted_stateful,
         )
     finally:
+        logger.info("Closing block device fd=%d", wfd)
         os.close(wfd)
 
+    logger.info("Finalizing block device %s...", spec.device)
     _finalize_device(spec.device)
+    logger.info("Device %s finalized.", spec.device)

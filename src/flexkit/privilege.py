@@ -47,6 +47,8 @@ def _is_compiled() -> bool:
 
 
 def _base_helper_command(port: int, token: str) -> tuple[list[str], dict[str, str]]:
+    from flexkit import get_log_settings
+
     args = [
         "--helper-daemon",
         "--port",
@@ -54,6 +56,11 @@ def _base_helper_command(port: int, token: str) -> tuple[list[str], dict[str, st
         "--token",
         token,
     ]
+    log_lvl, log_f = get_log_settings()
+    if log_lvl:
+        args.extend(["--log", log_lvl])
+    if log_f:
+        args.extend(["--log-file", str(log_f)])
     extra_env: dict[str, str] = {}
     if _is_compiled():
         exe = os.environ.get("NUITKA_ONEFILE_BINARY") or os.path.abspath(sys.argv[0])
@@ -337,10 +344,12 @@ class PrivilegedSession:
 
             cmd_payload = {"cmd": "write", "spec": spec.to_dict()}
             try:
+                log.info("Sending write command to privileged helper: device=%s, mode=%s", spec.device, spec.install_mode)
                 line = (json.dumps(cmd_payload, separators=(",", ":")) + "\n").encode("utf-8")
                 self._conn.sendall(line)
             except OSError as exc:
                 self._alive = False
+                log.error("Failed to send write command to privileged helper: %s", exc)
                 raise ElevationError("Failed to communicate with privileged helper.") from exc
 
             buf = self._buf
@@ -363,24 +372,30 @@ class PrivilegedSession:
                                 int(msg.get("bps") or 0),
                             )
                     elif ev == "done":
+                        log.info("Privileged helper confirmed write completion.")
                         self._buf = buf
                         return
                     elif ev == "cancelled":
+                        log.warning("Privileged helper confirmed cancellation.")
                         self._buf = buf
                         raise WriteCancelled()
                     elif ev == "error":
+                        err_msg = str(msg.get("message") or "Write failed.")
+                        log.error("Privileged helper returned error: %s", err_msg)
                         self._buf = buf
-                        raise WriteError(str(msg.get("message") or "Write failed."))
+                        raise WriteError(err_msg)
 
                 try:
                     chunk = self._conn.recv(4096)
                 except OSError as exc:
                     self._alive = False
+                    log.error("Socket error reading from privileged helper: %s", exc)
                     if cancelled:
                         raise WriteCancelled()
                     raise ElevationError("Lost connection to privileged writer.") from exc
                 if not chunk:
                     self._alive = False
+                    log.error("Privileged helper closed socket unexpectedly (chunk empty).")
                     if cancelled:
                         raise WriteCancelled()
                     raise WriteError("Privileged writer terminated unexpectedly.")

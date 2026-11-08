@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import socket
@@ -19,6 +20,7 @@ from flexkit.drives import _drive_hosts_path, enumerate_all_drives
 from flexkit.writer.gpt import (
     CHROMEOS_STATE_TYPE,
     ChromeOSBootOptions,
+    SECTOR_SIZE,
     build_protective_mbr,
     generate_chromeos_togo_partitions,
     is_chromeos_drive,
@@ -28,6 +30,8 @@ from flexkit.writer.gpt import (
     read_gpt_table,
     serialize_gpt,
 )
+
+logger = logging.getLogger("flexkit.writer")
 
 WRITE_BLOCK_SIZE = 4 * 1024 * 1024
 FSYNC_INTERVAL = 32 * 1024 * 1024
@@ -173,12 +177,22 @@ def stream_zip_to_fd(
 
     is_togo = install_mode in ("to_go_fresh", "to_go_update")
     target_write_size = CHROMEOS_OS_PAYLOAD_SIZE if is_togo else image_size
+    logger.info(
+        "Starting stream_source_to_fd: write_fd=%d, target_size=%d, image_size=%d, mode=%s, verify=%s, sha1=%s",
+        write_fd,
+        target_write_size,
+        image_size,
+        install_mode,
+        verify_drive,
+        expected_sha1,
+    )
 
     if progress_cb is not None:
         progress_cb("write", 0, target_write_size, 0)
 
     if install_mode == "to_go_fresh" and expected_size > 0:
         total_sectors = expected_size // SECTOR_SIZE
+        logger.info("Generating ChromeOS To-Go fresh GPT for total_sectors=%d", total_sectors)
         mbr = build_protective_mbr(total_sectors)
         parts = generate_chromeos_togo_partitions(total_sectors)
         primary_hdr, entries, backup_hdr = serialize_gpt(total_sectors, parts)
@@ -190,6 +204,7 @@ def stream_zip_to_fd(
         os.pwrite(write_fd, backup_hdr, (total_sectors - 1) * SECTOR_SIZE)
         os.lseek(write_fd, 34 * SECTOR_SIZE, os.SEEK_SET)
 
+    last_logged_mb = 0
     with open_image_source(archive_path, member_name, image_size) as src:
         if install_mode == "to_go_fresh":
             # Skip LBA 0..33 in the source archive so we don't overwrite our To-Go GPT
@@ -235,6 +250,16 @@ def stream_zip_to_fd(
             if progress_cb is not None:
                 progress_cb("write", written, target_write_size, bps)
 
+            if written - last_logged_mb >= 500 * 1024 * 1024 or written == target_write_size:
+                logger.info(
+                    "Write progress: %d / %d bytes (%.1f%%) @ %d bps",
+                    written,
+                    target_write_size,
+                    (written / target_write_size) * 100 if target_write_size > 0 else 0,
+                    bps,
+                )
+                last_logged_mb = written
+
     if install_mode == "to_go_fresh":
         # Zero out the first 16 MiB of the expanded STATE partition so ChromeOS initializes it cleanly
         state_wipe_len = 16 * 1024 * 1024
@@ -270,9 +295,11 @@ def stream_zip_to_fd(
         raise WriteError("Decompressed image SHA-1 did not match expected digest.")
 
     if not verify_drive:
+        logger.info("Verification skipped by user option.")
         return
 
     if before_verify_hook is not None:
+        logger.info("Calling before_verify_hook...")
         before_verify_hook()
 
     read_fd = open_read_fd() if open_read_fd is not None else write_fd
@@ -280,6 +307,8 @@ def stream_zip_to_fd(
     if not need_close_read:
         os.lseek(write_fd, 0, os.SEEK_SET)
 
+    logger.info("Beginning read-back verification of %d bytes on fd=%d", target_write_size, read_fd)
+    last_logged_v_mb = 0
     try:
         verify_sha1 = hashlib.sha1()
         checked = 0
@@ -310,8 +339,21 @@ def stream_zip_to_fd(
             if progress_cb is not None:
                 progress_cb("verify", checked, target_write_size, bps)
 
-        if verify_sha1.hexdigest().lower() != computed_sha1 and install_mode == "installer" and not has_custom_boot:
+            if checked - last_logged_v_mb >= 500 * 1024 * 1024 or checked == target_write_size:
+                logger.info(
+                    "Verify progress: %d / %d bytes (%.1f%%) @ %d bps",
+                    checked,
+                    target_write_size,
+                    (checked / target_write_size) * 100 if target_write_size > 0 else 0,
+                    bps,
+                )
+                last_logged_v_mb = checked
+
+        v_hex = verify_sha1.hexdigest().lower()
+        logger.info("Read-back verification completed. Checksum: %s", v_hex)
+        if v_hex != computed_sha1 and install_mode == "installer" and not has_custom_boot:
             raise WriteError("Verification failed: data read back from drive did not match image SHA-1.")
+        logger.info("Drive verification successful!")
     finally:
         if need_close_read:
             os.close(read_fd)
@@ -347,12 +389,18 @@ def run_writer_cli(argv: list[str]) -> int:
     parser.add_argument("--sha1", default="")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--token", required=True)
+    parser.add_argument("--log", default=None)
+    parser.add_argument("--log-file", default=None)
     args, _ = parser.parse_known_args(argv)
 
     try:
         sock = socket.create_connection(("127.0.0.1", args.port), timeout=10.0)
-    except OSError:
+        sock.settimeout(None)
+    except OSError as exc:
+        logger.error("Helper connection to port %d failed: %s", args.port, exc)
         return 2
+
+    logger.info("Privileged helper connected to supervisor on port %d", args.port)
 
     send_lock = threading.Lock()
 
@@ -484,11 +532,21 @@ def run_writer_cli(argv: list[str]) -> int:
 
                     def run_daemon_write() -> None:
                         try:
+                            logger.info(
+                                "Daemon write starting: device=%s, mode=%s, size=%d, verify=%s",
+                                spec.device,
+                                spec.install_mode,
+                                spec.expected_size,
+                                spec.verify_drive,
+                            )
                             execute_write(spec, progress_cb=on_daemon_progress, cancel_check=active_cancel.is_set)
+                            logger.info("Daemon write completed successfully for %s", spec.device)
                             send_msg({"event": "done"})
                         except WriteCancelled:
+                            logger.warning("Daemon write cancelled by user")
                             send_msg({"event": "cancelled"})
                         except Exception as exc:
+                            logger.exception("Daemon write failed: %s", exc)
                             send_msg({"event": "error", "message": str(exc)})
 
                     write_thread = threading.Thread(target=run_daemon_write, daemon=True)

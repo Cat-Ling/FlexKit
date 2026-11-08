@@ -201,18 +201,29 @@ class WriteWorker(QThread):
     def run(self) -> None:
         with SleepInhibitor("Writing ChromeOS Flex USB installer"):
             try:
+                log.info(
+                    "Starting write worker for %s (size=%d, mode=%s, verify=%s)",
+                    self._spec.device,
+                    self._spec.image_size,
+                    self._spec.install_mode,
+                    self._spec.verify_drive,
+                )
                 run_privileged_write(
                     self._spec,
                     password_prompt=self._prompt_password,
                     progress_cb=self._on_progress,
                     register_cancel=lambda fn: setattr(self, "_cancel_fn", fn),
                 )
+                log.info("Write worker finished successfully.")
                 self.completed.emit()
             except ElevationCancelled:
+                log.warning("Write worker cancelled by user during elevation.")
                 self.cancelled.emit(False)
             except WriteCancelled:
+                log.warning("Write worker cancelled by user during flashing.")
                 self.cancelled.emit(self._started_writing)
             except Exception as exc:
+                log.exception("Write worker failed: %s", exc)
                 self.failed.emit(str(exc))
 
 
@@ -463,6 +474,7 @@ class FlexKitWindow(QtWidgets.QMainWindow):
         return f"ChromeOS Flex {rel.version}" if rel else "ChromeOS Flex"
 
     def _go_to(self, step: Step) -> None:
+        log.info("Transitioned to step: %s", step.value)
         self._step = step
         if step != Step.DRIVES:
             self._drive_poll.stop()
