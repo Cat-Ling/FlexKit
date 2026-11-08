@@ -785,19 +785,37 @@ class DriveCard(QtWidgets.QWidget):
         top_y = 14.0 if has_reason else 17.0
 
         badge_w = 0.0
+        cur_x = self.width() - 18.0
         if drv.is_usb_hard_drive:
             tag_font = theme.make_font(12, QtGui.QFont.Weight.Medium)
             tag_txt = "USB HDD"
             tag_fm = QtGui.QFontMetrics(tag_font)
             tw = float(tag_fm.horizontalAdvance(tag_txt) + 16)
-            badge_w = tw + 8.0
-            tag_rect = QRectF(self.width() - 18.0 - tw, top_y + 1.0, tw, 21.0)
+            cur_x -= tw
+            tag_rect = QRectF(cur_x, top_y + 1.0, tw, 21.0)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(theme.color(theme.SURFACE_CONTAINER_HIGH))
             p.drawRoundedRect(tag_rect, 10.5, 10.5)
             p.setFont(tag_font)
             p.setPen(theme.color(theme.ON_SURFACE_VARIANT))
             p.drawText(tag_rect, Qt.AlignmentFlag.AlignCenter, tag_txt)
+            badge_w += tw + 8.0
+            cur_x -= 8.0
+
+        if drv.has_chromeos:
+            cros_font = theme.make_font(12, QtGui.QFont.Weight.Medium)
+            cros_txt = "ChromeOS Flex"
+            cros_fm = QtGui.QFontMetrics(cros_font)
+            cw = float(cros_fm.horizontalAdvance(cros_txt) + 16)
+            cur_x -= cw
+            cros_rect = QRectF(cur_x, top_y + 1.0, cw, 21.0)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(theme.color("#D2E3FC"))
+            p.drawRoundedRect(cros_rect, 10.5, 10.5)
+            p.setFont(cros_font)
+            p.setPen(theme.color(theme.PRIMARY))
+            p.drawText(cros_rect, Qt.AlignmentFlag.AlignCenter, cros_txt)
+            badge_w += cw + 8.0
 
         p.setFont(title_font)
         p.setPen(theme.color(title_col))

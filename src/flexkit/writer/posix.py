@@ -107,7 +107,7 @@ def write_block_device(
     _unmount_target(spec.device)
     io_path = _raw_device_path(spec.device)
 
-    flags = os.O_WRONLY
+    flags = os.O_RDWR
     if sys.platform.startswith("linux"):
         flags |= os.O_EXCL
 
@@ -118,19 +118,8 @@ def write_block_device(
     except OSError as exc:
         raise WriteError(f"Could not gain exclusive access to {spec.device}: {exc}") from exc
 
-    wfd_closed = False
-
-    def close_writer_and_flush() -> None:
-        nonlocal wfd_closed
-        if not wfd_closed:
-            _flush_block_cache(wfd, spec.image_size)
-            os.close(wfd)
-            wfd_closed = True
-
-    def open_verify_fd() -> int:
-        rfd = os.open(io_path, os.O_RDONLY)
-        _flush_block_cache(rfd, spec.image_size)
-        return rfd
+    def flush_cache() -> None:
+        _flush_block_cache(wfd, spec.image_size)
 
     try:
         stream_zip_to_fd(
@@ -139,13 +128,21 @@ def write_block_device(
             image_size=spec.image_size,
             expected_sha1=spec.expected_sha1,
             write_fd=wfd,
-            open_read_fd=open_verify_fd,
+            open_read_fd=None,
             progress_cb=progress_cb,
             cancel_check=cancel_check,
-            before_verify_hook=close_writer_and_flush,
+            before_verify_hook=flush_cache,
+            verify_drive=spec.verify_drive,
+            install_mode=spec.install_mode,
+            expected_size=spec.expected_size,
+            cros_debug=spec.cros_debug,
+            disable_auto_updates=spec.disable_auto_updates,
+            verbose_boot=spec.verbose_boot,
+            timeout=spec.timeout,
+            nomodeset=spec.nomodeset,
+            unencrypted_stateful=spec.unencrypted_stateful,
         )
     finally:
-        if not wfd_closed:
-            os.close(wfd)
+        os.close(wfd)
 
     _finalize_device(spec.device)

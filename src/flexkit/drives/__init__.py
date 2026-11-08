@@ -27,6 +27,7 @@ class Drive:
     volumes: tuple[Volume, ...]
     system: bool
     read_only: bool
+    has_chromeos: bool = False
 
     @property
     def is_usb_hard_drive(self) -> bool:

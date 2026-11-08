@@ -135,6 +135,13 @@ def parse_lsblk_json(payload: str | bytes) -> list[Drive]:
         volumes: list[Volume] = []
         is_system, _ = _collect_tree(dev, volumes, is_root_node=True)
 
+        from flexkit.writer.gpt import is_chromeos_drive
+
+        vol_labels = {v.label.upper() for v in volumes}
+        has_cros = {"STATE", "KERN-A"}.issubset(vol_labels) or {"STATE", "ROOT-A"}.issubset(vol_labels)
+        if not has_cros:
+            has_cros = is_chromeos_drive(dev_path)
+
         drives.append(
             Drive(
                 id=dev_path,
@@ -146,6 +153,7 @@ def parse_lsblk_json(payload: str | bytes) -> list[Drive]:
                 volumes=tuple(volumes),
                 system=is_system,
                 read_only=ro,
+                has_chromeos=has_cros,
             )
         )
     return drives

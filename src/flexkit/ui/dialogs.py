@@ -33,14 +33,15 @@ class ScrimSheet(QtWidgets.QWidget):
         host.installEventFilter(self)
 
         outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setContentsMargins(8, 8, 8, 8)
         outer.addStretch(1)
 
         row = QtWidgets.QHBoxLayout()
         row.addStretch(1)
-        self.card = _CardFrame(theme.SURFACE, radius=28.0, parent=self)
-        self.card.setMinimumWidth(330)
-        self.card.setMaximumWidth(480)
+        self.card = _CardFrame(theme.SURFACE, radius=24.0, parent=self)
+        self.card.setMinimumWidth(320)
+        max_w = min(540, max(340, host.width() - 32))
+        self.card.setMaximumWidth(max_w)
         self.card.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Minimum)
         row.addWidget(self.card, 1)
         row.addStretch(1)
@@ -49,8 +50,8 @@ class ScrimSheet(QtWidgets.QWidget):
         outer.addStretch(1)
 
         self.card_layout = QtWidgets.QVBoxLayout(self.card)
-        self.card_layout.setContentsMargins(24, 22, 24, 18)
-        self.card_layout.setSpacing(12)
+        self.card_layout.setContentsMargins(22, 18, 22, 16)
+        self.card_layout.setSpacing(10)
 
         self.setGeometry(host.rect())
 
@@ -96,52 +97,65 @@ class ScrimSheet(QtWidgets.QWidget):
         p.end()
 
 
-def confirm_write_dialog(host: QtWidgets.QWidget, image: PreparedImage | Release, drive: Drive) -> bool:
+def confirm_write_dialog(
+    host: QtWidgets.QWidget,
+    image: PreparedImage | Release,
+    drive: Drive,
+    install_mode: str = "installer",
+) -> bool:
     sheet = ScrimSheet(host)
     lay = sheet.card_layout
 
-    icon = BadgeIcon("warning", bg_hex=theme.ERROR_CONTAINER, fg_hex=theme.ERROR, box_size=44, parent=sheet.card)
+    is_update = install_mode == "to_go_update"
+
+    if is_update:
+        icon = BadgeIcon("flex", bg_hex="#D2E3FC", fg_hex=theme.PRIMARY, box_size=40, parent=sheet.card)
+        title_text = "Update ChromeOS Flex?"
+    else:
+        icon = BadgeIcon("warning", bg_hex=theme.ERROR_CONTAINER, fg_hex=theme.ERROR, box_size=40, parent=sheet.card)
+        title_text = "Erase and write drive?"
+
     lay.addWidget(icon, 0, Qt.AlignmentFlag.AlignLeft)
 
-    title = QtWidgets.QLabel("Erase this drive?", sheet.card)
-    title.setFont(theme.make_font(22, QtGui.QFont.Weight.Normal))
+    title = QtWidgets.QLabel(title_text, sheet.card)
+    title.setFont(theme.make_font(21, QtGui.QFont.Weight.Normal))
     lay.addWidget(title)
 
-    info_box = _CardFrame(theme.SURFACE_CONTAINER, radius=14.0, parent=sheet.card)
-    info_lay = QtWidgets.QVBoxLayout(info_box)
-    info_lay.setContentsMargins(16, 12, 16, 12)
-    info_lay.setSpacing(6)
+    info_box = _CardFrame(theme.SURFACE_CONTAINER, radius=12.0, parent=sheet.card)
+    info_grid = QtWidgets.QGridLayout(info_box)
+    info_grid.setContentsMargins(14, 10, 14, 10)
+    info_grid.setHorizontalSpacing(14)
+    info_grid.setVerticalSpacing(4)
 
-    def add_kv(k: str, v: str) -> None:
+    def add_row(r: int, k: str, v: str) -> None:
         lbl_k = QtWidgets.QLabel(k, info_box)
         lbl_k.setFont(theme.make_font(12, QtGui.QFont.Weight.Medium))
         lbl_k.setStyleSheet(f"color: {theme.ON_SURFACE_VARIANT}; background: transparent;")
         lbl_v = QtWidgets.QLabel(v, info_box)
-        lbl_v.setWordWrap(True)
-        lbl_v.setFont(theme.make_font(14, QtGui.QFont.Weight.Medium))
+        lbl_v.setFont(theme.make_font(13, QtGui.QFont.Weight.Normal))
         lbl_v.setStyleSheet("background: transparent;")
-        info_lay.addWidget(lbl_k)
-        info_lay.addWidget(lbl_v)
+        lbl_v.setWordWrap(True)
+        info_grid.addWidget(lbl_k, r, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        info_grid.addWidget(lbl_v, r, 1)
+
+    drive_desc = f"{drive.name} · {format_bytes(drive.size)} ({drive.id})"
+    add_row(0, "Target", drive_desc)
+
+    if is_update:
+        mode_desc = "ChromeOS To Go (Preserve user data)"
+    elif install_mode == "to_go_fresh":
+        mode_desc = "ChromeOS To Go (Full drive install)"
+    else:
+        mode_desc = "USB Recovery Installer"
+    add_row(1, "Mode", mode_desc)
 
     if isinstance(image, PreparedImage):
-        sub_part = f" ({image.subtitle})" if image.subtitle else ""
-        img_desc = f"{image.title}{sub_part} · {format_bytes(image.image_size)}"
+        img_desc = f"{image.title} · {format_bytes(image.image_size)}"
     else:
-        chrome_part = f" · Chrome {image.chrome_version.split('.')[0]}" if image.chrome_version else ""
-        img_desc = f"ChromeOS Flex {image.version} ({image.channel.label}{chrome_part}) · {format_bytes(image.image_size)}"
-    add_kv("Image", img_desc)
+        img_desc = f"ChromeOS Flex {image.version} ({image.channel.label})"
+    add_row(2, "Image", img_desc)
 
-    vol_desc = ", ".join(
-        f"{v.label} ({v.mountpoint})" if v.label and v.mountpoint else (v.label or v.mountpoint or v.device)
-        for v in drive.volumes
-    )
-    drive_lines = [f"{drive.name}", f"{format_bytes(drive.size)} · {drive.bus} · {drive.id}"]
-    if drive.serial:
-        drive_lines.append(f"Serial: {drive.serial}")
-    if vol_desc:
-        drive_lines.append(f"Volumes: {vol_desc}")
-    add_kv("Target drive", "\n".join(drive_lines))
-
+    info_grid.setColumnStretch(1, 1)
     lay.addWidget(info_box)
 
     if drive.is_usb_hard_drive:
@@ -149,9 +163,18 @@ def confirm_write_dialog(host: QtWidgets.QWidget, image: PreparedImage | Release
         hdd_warn.show_message("This is a USB hard drive, not a flash drive.")
         lay.addWidget(hdd_warn)
 
-    warn_txt = QtWidgets.QLabel("All data on this drive will be permanently erased.", sheet.card)
+    if is_update:
+        warn_txt = QtWidgets.QLabel(
+            "User accounts and files in the STATE partition will remain completely safe. Only OS partitions will be updated.",
+            sheet.card,
+        )
+    else:
+        warn_txt = QtWidgets.QLabel(
+            "All existing data and partitions on this drive will be permanently erased.",
+            sheet.card,
+        )
     warn_txt.setWordWrap(True)
-    warn_txt.setFont(theme.make_font(14, QtGui.QFont.Weight.Normal))
+    warn_txt.setFont(theme.make_font(13, QtGui.QFont.Weight.Normal))
     warn_txt.setStyleSheet(f"color: {theme.ON_SURFACE_VARIANT}; background: transparent;")
     lay.addWidget(warn_txt)
 
@@ -159,13 +182,16 @@ def confirm_write_dialog(host: QtWidgets.QWidget, image: PreparedImage | Release
     btn_row.addStretch(1)
     cancel_btn = TextButton("Cancel", sheet.card)
     cancel_btn.clicked.connect(sheet.reject)
-    confirm_btn = DestructiveButton("Erase and write", sheet.card)
+    if is_update:
+        confirm_btn = FilledButton("Update OS", sheet.card)
+    else:
+        confirm_btn = DestructiveButton("Erase and write", sheet.card)
     confirm_btn.clicked.connect(sheet.accept)
     btn_row.addWidget(cancel_btn)
     btn_row.addWidget(confirm_btn)
     lay.addLayout(btn_row)
 
-    if drive.is_usb_hard_drive:
+    if drive.is_usb_hard_drive and not is_update:
         remaining = [2]
         confirm_btn.setEnabled(False)
         confirm_btn.setText("Erase and write (2)")

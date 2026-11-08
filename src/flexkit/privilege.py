@@ -18,6 +18,7 @@ import threading
 import time
 
 from flexkit.writer import WriteCancelled, WriteError, WriteProgressCallback, WriteSpec
+from flexkit.writer.gpt import ChromeOSBootOptions
 
 log = logging.getLogger("flexkit.privilege")
 
@@ -45,23 +46,9 @@ def _is_compiled() -> bool:
     return "__compiled__" in globals() or bool(getattr(sys, "frozen", False))
 
 
-def _base_helper_command(spec: WriteSpec, port: int, token: str) -> tuple[list[str], dict[str, str]]:
+def _base_helper_command(port: int, token: str) -> tuple[list[str], dict[str, str]]:
     args = [
-        "--write",
-        "--archive",
-        str(spec.archive_path.resolve()),
-        "--member",
-        spec.member_name,
-        "--device",
-        spec.device,
-        "--serial",
-        spec.expected_serial,
-        "--size",
-        str(spec.expected_size),
-        "--image-size",
-        str(spec.image_size),
-        "--sha1",
-        spec.expected_sha1,
+        "--helper-daemon",
         "--port",
         str(port),
         "--token",
@@ -297,45 +284,234 @@ def _spawn_windows_uac(cmd: list[str], extra_env: dict[str, str]) -> tuple[Calla
     return is_alive, cleanup
 
 
-def run_privileged_write(
-    spec: WriteSpec,
-    *,
+class PrivilegedSession:
+    _instance: PrivilegedSession | None = None
+    _global_lock = threading.Lock()
+
+    def __init__(
+        self,
+        bridge: _HelperBridge,
+        conn: socket.socket,
+        proc: subprocess.Popen | None = None,
+        cleanup_fn: Callable[[], None] | None = None,
+    ) -> None:
+        self._bridge = bridge
+        self._conn = conn
+        self._proc = proc
+        self._cleanup_fn = cleanup_fn
+        self._lock = threading.Lock()
+        self._alive = True
+        self._buf = getattr(bridge, "_initial_rest", b"")
+
+    def is_alive(self) -> bool:
+        if not self._alive:
+            return False
+        if self._proc is not None and self._proc.poll() is not None:
+            self._alive = False
+            return False
+        return True
+
+    def execute_write(
+        self,
+        spec: WriteSpec,
+        *,
+        progress_cb: WriteProgressCallback | None = None,
+        register_cancel: Callable[[Callable[[], None]], None] | None = None,
+    ) -> None:
+        with self._lock:
+            if not self.is_alive():
+                raise ElevationError("Privileged helper is not running.")
+
+            cancelled = False
+
+            def request_cancel() -> None:
+                nonlocal cancelled
+                cancelled = True
+                try:
+                    self._conn.sendall(b'{"cmd":"cancel"}\n')
+                except OSError:
+                    pass
+
+            if register_cancel is not None:
+                register_cancel(request_cancel)
+
+            cmd_payload = {"cmd": "write", "spec": spec.to_dict()}
+            try:
+                line = (json.dumps(cmd_payload, separators=(",", ":")) + "\n").encode("utf-8")
+                self._conn.sendall(line)
+            except OSError as exc:
+                self._alive = False
+                raise ElevationError("Failed to communicate with privileged helper.") from exc
+
+            buf = self._buf
+            while True:
+                while b"\n" in buf:
+                    raw_line, buf = buf.split(b"\n", 1)
+                    if not raw_line.strip():
+                        continue
+                    try:
+                        msg = json.loads(raw_line.decode("utf-8"))
+                    except json.JSONDecodeError:
+                        continue
+                    ev = msg.get("event")
+                    if ev == "progress":
+                        if progress_cb is not None:
+                            progress_cb(
+                                str(msg.get("phase") or "write"),
+                                int(msg.get("done") or 0),
+                                int(msg.get("total") or 0),
+                                int(msg.get("bps") or 0),
+                            )
+                    elif ev == "done":
+                        self._buf = buf
+                        return
+                    elif ev == "cancelled":
+                        self._buf = buf
+                        raise WriteCancelled()
+                    elif ev == "error":
+                        self._buf = buf
+                        raise WriteError(str(msg.get("message") or "Write failed."))
+
+                try:
+                    chunk = self._conn.recv(4096)
+                except OSError as exc:
+                    self._alive = False
+                    if cancelled:
+                        raise WriteCancelled()
+                    raise ElevationError("Lost connection to privileged writer.") from exc
+                if not chunk:
+                    self._alive = False
+                    if cancelled:
+                        raise WriteCancelled()
+                    raise WriteError("Privileged writer terminated unexpectedly.")
+                buf += chunk
+
+    def read_boot_options(self, device: str) -> ChromeOSBootOptions | None:
+        with self._lock:
+            if not self.is_alive():
+                return None
+            try:
+                cmd = {"cmd": "read_boot_options", "device": device}
+                self._conn.sendall((json.dumps(cmd) + "\n").encode("utf-8"))
+                buf = self._buf
+                start_t = time.monotonic()
+                while time.monotonic() - start_t < 10.0:
+                    while b"\n" in buf:
+                        raw_line, buf = buf.split(b"\n", 1)
+                        if not raw_line.strip():
+                            continue
+                        msg = json.loads(raw_line.decode("utf-8"))
+                        if msg.get("event") == "boot_options":
+                            self._buf = buf
+                            opts_d = msg.get("options")
+                            return ChromeOSBootOptions.from_dict(opts_d) if opts_d else None
+                    chunk = self._conn.recv(4096)
+                    if not chunk:
+                        self._alive = False
+                        return None
+                    buf += chunk
+                return None
+            except Exception:
+                return None
+
+    def patch_boot_options(self, device: str, options: ChromeOSBootOptions) -> bool:
+        with self._lock:
+            if not self.is_alive():
+                return False
+            try:
+                cmd = {"cmd": "patch_boot_options", "device": device, "options": options.to_dict()}
+                self._conn.sendall((json.dumps(cmd) + "\n").encode("utf-8"))
+                buf = self._buf
+                start_t = time.monotonic()
+                while time.monotonic() - start_t < 10.0:
+                    while b"\n" in buf:
+                        raw_line, buf = buf.split(b"\n", 1)
+                        if not raw_line.strip():
+                            continue
+                        msg = json.loads(raw_line.decode("utf-8"))
+                        if msg.get("event") == "boot_options_patched":
+                            self._buf = buf
+                            return bool(msg.get("ok"))
+                    chunk = self._conn.recv(4096)
+                    if not chunk:
+                        self._alive = False
+                        return False
+                    buf += chunk
+                return False
+            except Exception:
+                return False
+
+    def close(self) -> None:
+        with self._lock:
+            if not self._alive:
+                return
+            self._alive = False
+            try:
+                self._conn.sendall(b'{"cmd":"quit"}\n')
+            except OSError:
+                pass
+            try:
+                self._conn.close()
+            except OSError:
+                pass
+            self._bridge.close()
+            if self._proc is not None:
+                try:
+                    self._proc.wait(timeout=2.0)
+                except Exception:
+                    self._proc.kill()
+            if self._cleanup_fn is not None:
+                self._cleanup_fn()
+
+
+def get_active_privileged_session() -> PrivilegedSession | None:
+    with PrivilegedSession._global_lock:
+        if PrivilegedSession._instance is not None and PrivilegedSession._instance.is_alive():
+            return PrivilegedSession._instance
+        return None
+
+
+def close_privileged_session() -> None:
+    with PrivilegedSession._global_lock:
+        if PrivilegedSession._instance is not None:
+            PrivilegedSession._instance.close()
+            PrivilegedSession._instance = None
+
+
+def ensure_privileged_session(
     password_prompt: PasswordPrompt | None = None,
-    progress_cb: WriteProgressCallback | None = None,
-    register_cancel: Callable[[Callable[[], None]], None] | None = None,
-) -> None:
-    token = secrets.token_hex(32)
-    bridge = _HelperBridge(token)
-    if register_cancel is not None:
-        register_cancel(bridge.request_cancel)
+) -> PrivilegedSession:
+    with PrivilegedSession._global_lock:
+        if PrivilegedSession._instance is not None and PrivilegedSession._instance.is_alive():
+            return PrivilegedSession._instance
 
-    cmd, extra_env = _base_helper_command(spec, bridge.port, token)
-    wrapped = _wrap_env(cmd, extra_env)
+        token = secrets.token_hex(32)
+        bridge = _HelperBridge(token)
+        cmd, extra_env = _base_helper_command(bridge.port, token)
+        wrapped = _wrap_env(cmd, extra_env)
 
-    try:
         if is_privileged():
             env = {**os.environ, **extra_env}
             proc = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            try:
-                conn = bridge.accept_authenticated(lambda: proc.poll() is None)
-                if conn is None:
-                    err = (proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else "").strip()
-                    raise ElevationError(err or "Helper failed to start.")
-                bridge.consume_events(conn, progress_cb)
-            finally:
-                proc.wait(timeout=5.0)
-            return
+            conn = bridge.accept_authenticated(lambda: proc.poll() is None)
+            if conn is None:
+                bridge.close()
+                err = (proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else "").strip()
+                raise ElevationError(err or "Helper failed to start.")
+            sess = PrivilegedSession(bridge, conn, proc=proc)
+            PrivilegedSession._instance = sess
+            return sess
 
         if sys.platform == "win32":
             alive_fn, cleanup_fn = _spawn_windows_uac(cmd, extra_env)
-            try:
-                conn = bridge.accept_authenticated(alive_fn)
-                if conn is None:
-                    raise ElevationError("Elevated writer did not connect.")
-                bridge.consume_events(conn, progress_cb)
-            finally:
+            conn = bridge.accept_authenticated(alive_fn)
+            if conn is None:
+                bridge.close()
                 cleanup_fn()
-            return
+                raise ElevationError("Elevated writer did not connect.")
+            sess = PrivilegedSession(bridge, conn, cleanup_fn=cleanup_fn)
+            PrivilegedSession._instance = sess
+            return sess
 
         for tool in ("sudo", "doas"):
             if _can_run_passwordless(tool):
@@ -347,15 +523,14 @@ def run_privileged_write(
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                 )
-                try:
-                    conn = bridge.accept_authenticated(lambda: proc.poll() is None)
-                    if conn is not None:
-                        bridge.consume_events(conn, progress_cb)
-                        return
-                finally:
-                    if proc.poll() is None:
-                        proc.terminate()
-                    proc.wait(timeout=5.0)
+                conn = bridge.accept_authenticated(lambda: proc.poll() is None)
+                if conn is not None:
+                    sess = PrivilegedSession(bridge, conn, proc=proc)
+                    PrivilegedSession._instance = sess
+                    return sess
+                if proc.poll() is None:
+                    proc.terminate()
+                proc.wait(timeout=2.0)
 
         if sys.platform == "darwin" and shutil.which("osascript"):
             shell_cmd = " ".join(shlex.quote(part) for part in wrapped)
@@ -366,18 +541,16 @@ def run_privileged_write(
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
-            try:
-                conn = bridge.accept_authenticated(lambda: proc.poll() is None)
-                if conn is not None:
-                    bridge.consume_events(conn, progress_cb)
-                    return
-                proc.wait(timeout=5.0)
-                stderr_txt = (proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else "").lower()
-                if "canceled" in stderr_txt or "-128" in stderr_txt:
-                    raise ElevationCancelled()
-            finally:
-                if proc.poll() is None:
-                    proc.terminate()
+            conn = bridge.accept_authenticated(lambda: proc.poll() is None)
+            if conn is not None:
+                sess = PrivilegedSession(bridge, conn, proc=proc)
+                PrivilegedSession._instance = sess
+                return sess
+            proc.wait(timeout=2.0)
+            stderr_txt = (proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else "").lower()
+            if "canceled" in stderr_txt or "-128" in stderr_txt:
+                bridge.close()
+                raise ElevationCancelled()
 
         pkexec_exe = shutil.which("pkexec")
         if pkexec_exe and sys.platform != "darwin":
@@ -387,19 +560,17 @@ def run_privileged_write(
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
-            try:
-                conn = bridge.accept_authenticated(lambda: proc.poll() is None)
-                if conn is not None:
-                    bridge.consume_events(conn, progress_cb)
-                    return
-                rc = proc.wait(timeout=5.0)
-                stderr_txt = (proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else "").lower()
-                if rc == 126 or "dismissed" in stderr_txt:
-                    raise ElevationCancelled()
-                log.info("pkexec unavailable in session (rc=%s), falling back to password prompt", rc)
-            finally:
-                if proc.poll() is None:
-                    proc.terminate()
+            conn = bridge.accept_authenticated(lambda: proc.poll() is None)
+            if conn is not None:
+                sess = PrivilegedSession(bridge, conn, proc=proc)
+                PrivilegedSession._instance = sess
+                return sess
+            rc = proc.wait(timeout=2.0)
+            stderr_txt = (proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else "").lower()
+            if rc == 126 or "dismissed" in stderr_txt:
+                bridge.close()
+                raise ElevationCancelled()
+            log.info("pkexec unavailable in session (rc=%s), falling back to password prompt", rc)
 
         for gui_sudo, flag in (("kdesu", "-c"), ("lxqt-sudo", "-s")):
             gui_exe = shutil.which(gui_sudo)
@@ -415,25 +586,27 @@ def run_privileged_write(
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                 )
-                try:
-                    conn = bridge.accept_authenticated(lambda: proc.poll() is None)
-                    if conn is not None:
-                        bridge.consume_events(conn, progress_cb)
-                        return
-                finally:
-                    if proc.poll() is None:
-                        proc.terminate()
+                conn = bridge.accept_authenticated(lambda: proc.poll() is None)
+                if conn is not None:
+                    sess = PrivilegedSession(bridge, conn, proc=proc)
+                    PrivilegedSession._instance = sess
+                    return sess
+                if proc.poll() is None:
+                    proc.terminate()
 
         sudo_exe = shutil.which("sudo")
         if not sudo_exe:
+            bridge.close()
             raise ElevationError("Administrator privileges required, and neither pkexec nor sudo was found.")
         if password_prompt is None:
+            bridge.close()
             raise ElevationError("Authentication required to write to USB drive.")
 
         prompt_err: str | None = None
         for _ in range(3):
             pw = password_prompt(prompt_err)
             if pw is None:
+                bridge.close()
                 raise ElevationCancelled()
             try:
                 if not _verify_sudo_password(sudo_exe, pw):
@@ -453,15 +626,27 @@ def run_privileged_write(
                     if conn is None:
                         err_out = (proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else "").strip()
                         raise ElevationError(err_out or "Failed to launch privileged writer.")
-                    bridge.consume_events(conn, progress_cb)
-                    return
-                finally:
+                    sess = PrivilegedSession(bridge, conn, proc=proc)
+                    PrivilegedSession._instance = sess
+                    return sess
+                except Exception:
                     if proc.poll() is None:
                         proc.terminate()
-                    proc.wait(timeout=5.0)
+                    proc.wait(timeout=2.0)
+                    raise
             finally:
                 _zero_bytes(pw)
 
-        raise ElevationError("Authentication failed after 3 attempts.")
-    finally:
         bridge.close()
+        raise ElevationError("Authentication failed after 3 attempts.")
+
+
+def run_privileged_write(
+    spec: WriteSpec,
+    *,
+    password_prompt: PasswordPrompt | None = None,
+    progress_cb: WriteProgressCallback | None = None,
+    register_cancel: Callable[[Callable[[], None]], None] | None = None,
+) -> None:
+    session = ensure_privileged_session(password_prompt=password_prompt)
+    session.execute_write(spec, progress_cb=progress_cb, register_cancel=register_cancel)

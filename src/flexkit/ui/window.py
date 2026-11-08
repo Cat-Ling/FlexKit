@@ -22,7 +22,7 @@ from flexkit.download import (
 )
 from flexkit.drives import Drive, DriveEntry, list_drives
 from flexkit.power import SleepInhibitor
-from flexkit.privilege import ElevationCancelled, run_privileged_write
+from flexkit.privilege import ElevationCancelled, close_privileged_session, run_privileged_write
 from flexkit.ui import theme
 from flexkit.ui.dialogs import confirm_stop_write_dialog, confirm_write_dialog, password_dialog
 from flexkit.ui.pages import DonePage, DrivePage, ProgressPage, SetupPage, WelcomePage
@@ -681,7 +681,8 @@ class FlexKitWindow(QtWidgets.QMainWindow):
             drv = self.drive_page.selected_drive()
             if drv is None or self._prepared is None:
                 return
-            if confirm_write_dialog(self, self._prepared, drv):
+            mode = self.drive_page.install_mode()
+            if confirm_write_dialog(self, self._prepared, drv, install_mode=mode):
                 self._target_drive = drv
                 self._start_write(drv)
             return
@@ -806,6 +807,10 @@ class FlexKitWindow(QtWidgets.QMainWindow):
 
     def _start_write(self, drive: Drive) -> None:
         assert self._prepared is not None
+        mode = self.drive_page.install_mode()
+        opts = self.drive_page.boot_options()
+        verify_drive = self.drive_page.verify_drive_checked()
+
         spec = WriteSpec(
             archive_path=self._prepared.source_path,
             member_name=self._prepared.member_name,
@@ -814,6 +819,14 @@ class FlexKitWindow(QtWidgets.QMainWindow):
             expected_size=drive.size,
             image_size=self._prepared.image_size,
             expected_sha1=self._prepared.sha1,
+            verify_drive=verify_drive,
+            install_mode=mode,
+            cros_debug=opts.cros_debug,
+            disable_auto_updates=opts.disable_auto_updates,
+            verbose_boot=opts.verbose_boot,
+            timeout=opts.timeout,
+            nomodeset=opts.nomodeset,
+            unencrypted_stateful=opts.unencrypted_stateful,
         )
         self.progress_page.reset_indeterminate()
         self._go_to(Step.WRITING)
@@ -879,6 +892,7 @@ class FlexKitWindow(QtWidgets.QMainWindow):
             if worker.isRunning():
                 worker.wait(5000)
 
+        close_privileged_session()
         event.accept()
 
 

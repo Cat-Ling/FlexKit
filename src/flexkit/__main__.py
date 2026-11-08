@@ -9,7 +9,7 @@ from flexkit import APP_ID, APP_NAME, PROGRAM_NAME, __version__, configure_loggi
 def main(argv: list[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
 
-    if "--write" in raw_args:
+    if "--write" in raw_args or "--helper-daemon" in raw_args:
         configure_logging(helper_mode=True)
         from flexkit.writer import run_writer_cli
 
@@ -44,7 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     state_dir.mkdir(parents=True, exist_ok=True)
     lock = QtCore.QLockFile(str(state_dir / "flexkit.lock"))
     lock.setStaleLockTime(0)
-    if not lock.tryLock(100):
+    if not args.self_test_gui and not lock.tryLock(100):
         msg = QtWidgets.QMessageBox()
         msg.setWindowTitle(APP_NAME)
         msg.setText(f"{APP_NAME} is already running.")

@@ -18,6 +18,7 @@ from flexkit.drives.windows import (
     _VOLUME_DISK_EXTENTS,
 )
 from flexkit.writer import (
+    CHROMEOS_OS_PAYLOAD_SIZE,
     WRITE_BLOCK_SIZE,
     WriteCancelled,
     WriteError,
@@ -156,19 +157,23 @@ def write_physical_drive(
         aligned_buf = mmap.mmap(-1, WRITE_BLOCK_SIZE)
         try:
             buf_addr = ctypes.addressof(ctypes.c_char.from_buffer(aligned_buf))
+            is_togo = spec.install_mode in ("to_go_fresh", "to_go_update")
+            target_write_size = CHROMEOS_OS_PAYLOAD_SIZE if is_togo else spec.image_size
+
             write_sha1 = hashlib.sha1()
             written = 0
             win_start = time.monotonic()
             win_bytes = 0
             bps = 0
             if progress_cb is not None:
-                progress_cb("write", 0, spec.image_size, 0)
+                progress_cb("write", 0, target_write_size, 0)
 
             with open_image_source(spec.archive_path, spec.member_name, spec.image_size) as src:
-                while True:
+                while written < target_write_size:
                     if cancel_check is not None and cancel_check():
                         raise WriteCancelled()
-                    chunk = src.read(WRITE_BLOCK_SIZE)
+                    to_read = min(WRITE_BLOCK_SIZE, target_write_size - written)
+                    chunk = src.read(to_read)
                     if not chunk:
                         break
                     write_sha1.update(chunk)
@@ -199,14 +204,18 @@ def write_physical_drive(
                         win_start = now
                         win_bytes = 0
                     if progress_cb is not None:
-                        progress_cb("write", written, spec.image_size, bps)
+                        progress_cb("write", written, target_write_size, bps)
 
             kernel32.FlushFileBuffers(h_disk)
             computed_sha1 = write_sha1.hexdigest().lower()
-            if written != spec.image_size or (
-                spec.expected_sha1 and computed_sha1 != spec.expected_sha1.lower()
+            if written != target_write_size or (
+                spec.expected_sha1 and computed_sha1 != spec.expected_sha1.lower() and spec.install_mode == "installer"
             ):
                 raise WriteError("Image write stream verification failed.")
+
+            if not spec.verify_drive:
+                kernel32.DeviceIoControl(h_disk, IOCTL_DISK_UPDATE_PROPERTIES, None, 0, None, 0, ctypes.byref(ret), None)
+                return
 
             new_pos = ctypes.c_longlong(0)
             if not kernel32.SetFilePointerEx(h_disk, ctypes.c_longlong(0), ctypes.byref(new_pos), 0):
@@ -218,12 +227,12 @@ def write_physical_drive(
             win_bytes = 0
             bps = 0
             if progress_cb is not None:
-                progress_cb("verify", 0, spec.image_size, 0)
+                progress_cb("verify", 0, target_write_size, 0)
 
-            while checked < spec.image_size:
+            while checked < target_write_size:
                 if cancel_check is not None and cancel_check():
                     raise WriteCancelled()
-                want = min(WRITE_BLOCK_SIZE, spec.image_size - checked)
+                want = min(WRITE_BLOCK_SIZE, target_write_size - checked)
                 io_want = want + ((SECTOR_SIZE - (want % SECTOR_SIZE)) % SECTOR_SIZE)
                 bytes_read = wintypes.DWORD(0)
                 if not kernel32.ReadFile(
@@ -246,9 +255,9 @@ def write_physical_drive(
                     win_start = now
                     win_bytes = 0
                 if progress_cb is not None:
-                    progress_cb("verify", checked, spec.image_size, bps)
+                    progress_cb("verify", checked, target_write_size, bps)
 
-            if verify_sha1.hexdigest().lower() != computed_sha1:
+            if verify_sha1.hexdigest().lower() != computed_sha1 and spec.install_mode == "installer":
                 raise WriteError("Verification failed: data read back from drive did not match image SHA-1.")
 
             kernel32.DeviceIoControl(h_disk, IOCTL_DISK_UPDATE_PROPERTIES, None, 0, None, 0, ctypes.byref(ret), None)
