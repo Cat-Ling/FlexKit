@@ -9,6 +9,7 @@ from flexkit.ui.qt import QPointF, QRectF, Qt, QtGui, QtWidgets, Signal
 from flexkit.ui.widgets import (
     BadgeIcon,
     Banner,
+    BootOptionTile,
     DriveCard,
     IconButton,
     LinearProgress,
@@ -303,26 +304,25 @@ class DrivePage(QtWidgets.QWidget):
         e_lay.addStretch(1)
         self.stack.addWidget(empty_card)
 
-        scroll = QtWidgets.QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._list_host = QtWidgets.QWidget(scroll)
+        self.scroll = QtWidgets.QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._list_host = QtWidgets.QWidget(self.scroll)
         self._list_layout = QtWidgets.QVBoxLayout(self._list_host)
         self._list_layout.setContentsMargins(0, 0, 4, 0)
         self._list_layout.setSpacing(10)
-        self._list_layout.addStretch(1)
-        scroll.setWidget(self._list_host)
-        self.stack.addWidget(scroll)
 
-        lay.addWidget(self.stack, 1)
+        self._drives_box = QtWidgets.QWidget(self._list_host)
+        self._drives_layout = QtWidgets.QVBoxLayout(self._drives_box)
+        self._drives_layout.setContentsMargins(0, 0, 0, 0)
+        self._drives_layout.setSpacing(8)
+        self._list_layout.addWidget(self._drives_box)
 
-        self.options_card = SurfaceCard(theme.SURFACE_LOW, theme.DIVIDER, radius=12.0, parent=self)
+        self.options_card = SurfaceCard(theme.SURFACE_LOW, theme.DIVIDER, radius=12.0, parent=self._list_host)
         opt_lay = QtWidgets.QVBoxLayout(self.options_card)
-        opt_lay.setContentsMargins(14, 10, 14, 10)
-        opt_lay.setSpacing(6)
+        opt_lay.setContentsMargins(14, 12, 14, 12)
+        opt_lay.setSpacing(10)
 
-        mode_row = QtWidgets.QHBoxLayout()
-        mode_row.setSpacing(8)
         self.mode_dropdown = OutlinedDropdown("Target Mode", self.options_card)
         self.mode_dropdown.setFixedHeight(54)
         self.mode_dropdown.set_items([
@@ -330,13 +330,18 @@ class DrivePage(QtWidgets.QWidget):
             ("ChromeOS To Go (Run from USB)", "to_go"),
         ])
         self.mode_dropdown.changed.connect(self._on_mode_changed)
-        mode_row.addWidget(self.mode_dropdown, 1)
-        opt_lay.addLayout(mode_row)
+        opt_lay.addWidget(self.mode_dropdown)
 
-        self.keep_data_cb = MaterialCheckbox("Keep existing user data (Update OS only)", self.options_card)
-        self.keep_data_cb.setChecked(True)
-        self.keep_data_cb.setVisible(False)
-        opt_lay.addWidget(self.keep_data_cb)
+        self.keep_data_tile = BootOptionTile(
+            "Keep existing user data (Update OS only)",
+            "Preserves user accounts, local files, and apps in the stateful partition; updates OS partitions only.",
+            checked=True,
+            parent=self.options_card,
+        )
+        self.keep_data_tile.setVisible(False)
+        self.keep_data_tile.toggled.connect(lambda _checked: self.selection_changed.emit())
+        opt_lay.addWidget(self.keep_data_tile)
+        self.keep_data_cb = self.keep_data_tile
 
         self.adv_btn = TextButton("▸ Advanced Boot Options", self.options_card)
         self.adv_btn.setFixedHeight(28)
@@ -345,72 +350,108 @@ class DrivePage(QtWidgets.QWidget):
 
         self.adv_container = QtWidgets.QWidget(self.options_card)
         adv_lay = QtWidgets.QVBoxLayout(self.adv_container)
-        adv_lay.setContentsMargins(4, 2, 4, 4)
+        adv_lay.setContentsMargins(0, 4, 0, 4)
         adv_lay.setSpacing(6)
 
-        def add_opt_row(cb: MaterialCheckbox, desc_text: str) -> None:
-            adv_lay.addWidget(cb)
-            lbl = QtWidgets.QLabel(desc_text, self.adv_container)
-            lbl.setFont(theme.make_font(12, QtGui.QFont.Weight.Normal))
-            lbl.setStyleSheet(f"color: {theme.ON_SURFACE_VARIANT}; background: transparent; margin-left: 36px;")
-            lbl.setWordWrap(True)
-            adv_lay.addWidget(lbl)
-
-        self.cros_debug_cb = MaterialCheckbox("Developer Shell (cros_debug)", self.adv_container)
-        add_opt_row(
-            self.cros_debug_cb,
-            "Enables root shell terminal on VT-2 (Ctrl+Alt+F2) and unlocks the 'shell' command in Crosh (Ctrl+Alt+T).",
+        self.cros_debug_tile = BootOptionTile(
+            "Developer Shell (cros_debug)",
+            "Enables root terminal on VT-2 (Ctrl+Alt+F2) and unlocks the 'shell' command in Crosh (Ctrl+Alt+T).",
+            parent=self.adv_container,
         )
+        adv_lay.addWidget(self.cros_debug_tile)
+        self.cros_debug_cb = self.cros_debug_tile
 
-        self.disable_au_cb = MaterialCheckbox("Disable Automatic Updates", self.adv_container)
-        add_opt_row(
-            self.disable_au_cb,
-            "Prevents background OTA updates from running automatically on this USB drive so you can manage upgrades manually.",
+        self.disable_au_tile = BootOptionTile(
+            "Disable Automatic Updates",
+            "Prevents background OTA updates from running on this USB drive so you can manage upgrades manually.",
+            parent=self.adv_container,
         )
+        adv_lay.addWidget(self.disable_au_tile)
+        self.disable_au_cb = self.disable_au_tile
 
-        self.verbose_cb = MaterialCheckbox("Verbose Boot Diagnostics", self.adv_container)
-        add_opt_row(
-            self.verbose_cb,
-            "Removes quiet bootsplash and prints early kernel driver logs on tty1 (loglevel=7) to diagnose boot hangs.",
+        self.verbose_tile = BootOptionTile(
+            "Verbose Boot Diagnostics",
+            "Removes quiet splash and prints kernel driver initialization logs to screen (tty1) to diagnose boot hangs.",
+            parent=self.adv_container,
         )
+        adv_lay.addWidget(self.verbose_tile)
+        self.verbose_cb = self.verbose_tile
 
-        self.nomodeset_cb = MaterialCheckbox("Legacy Graphics Mode (nomodeset)", self.adv_container)
-        add_opt_row(
-            self.nomodeset_cb,
-            "Disables early kernel mode setting (replaces i915.modeset=1 with nomodeset). Fixes freeze on older GPUs.",
+        self.nomodeset_tile = BootOptionTile(
+            "Legacy Graphics Mode (nomodeset)",
+            "Disables early kernel mode setting (replaces i915.modeset=1 with nomodeset). Fixes black screen on older GPUs.",
+            parent=self.adv_container,
         )
+        adv_lay.addWidget(self.nomodeset_tile)
+        self.nomodeset_cb = self.nomodeset_tile
 
-        self.unencrypted_cb = MaterialCheckbox("Fast USB I/O (Unencrypted Stateful)", self.adv_container)
-        add_opt_row(
-            self.unencrypted_cb,
-            "Bypasses user data partition encryption for faster read/write speeds on USB flash drives.",
+        self.unencrypted_tile = BootOptionTile(
+            "Fast USB I/O (Unencrypted Stateful)",
+            "Bypasses user data partition encryption for faster read/write throughput on USB flash drives.",
+            parent=self.adv_container,
         )
+        adv_lay.addWidget(self.unencrypted_tile)
+        self.unencrypted_cb = self.unencrypted_tile
 
-        timeout_row = QtWidgets.QHBoxLayout()
-        timeout_row.setContentsMargins(36, 4, 0, 0)
-        self.timeout_dropdown = OutlinedDropdown("Boot Menu Timeout", self.adv_container)
-        self.timeout_dropdown.setFixedHeight(54)
+        timeout_box = QtWidgets.QFrame(self.adv_container)
+        timeout_lay = QtWidgets.QHBoxLayout(timeout_box)
+        timeout_lay.setContentsMargins(10, 8, 10, 8)
+        timeout_lay.setSpacing(12)
+
+        timeout_text_lay = QtWidgets.QVBoxLayout()
+        timeout_text_lay.setContentsMargins(0, 0, 0, 0)
+        timeout_text_lay.setSpacing(2)
+
+        timeout_title = QtWidgets.QLabel("Boot Menu Timeout", timeout_box)
+        timeout_title.setFont(theme.make_font(14, QtGui.QFont.Weight.Medium))
+        timeout_title.setStyleSheet(f"color: {theme.ON_SURFACE}; background: transparent;")
+        timeout_text_lay.addWidget(timeout_title)
+
+        timeout_desc = QtWidgets.QLabel(
+            "Duration the GRUB boot menu displays before auto-booting default kernel.",
+            timeout_box,
+        )
+        timeout_desc.setFont(theme.make_font(12, QtGui.QFont.Weight.Normal))
+        timeout_desc.setStyleSheet(f"color: {theme.ON_SURFACE_VARIANT}; background: transparent;")
+        timeout_desc.setWordWrap(True)
+        timeout_text_lay.addWidget(timeout_desc)
+
+        timeout_lay.addLayout(timeout_text_lay, 1)
+
+        self.timeout_dropdown = OutlinedDropdown("Timeout", timeout_box)
+        self.timeout_dropdown.setFixedWidth(160)
+        self.timeout_dropdown.setFixedHeight(48)
         self.timeout_dropdown.set_items(
             [
-                ("0 seconds (Instant boot)", 0),
-                ("2 seconds (Default)", 2),
-                ("5 seconds", 5),
-                ("10 seconds", 10),
+                ("0s (Instant)", 0),
+                ("2s (Default)", 2),
+                ("5s", 5),
+                ("10s", 10),
             ],
             current_index=1,
         )
-        timeout_row.addWidget(self.timeout_dropdown, 1)
-        adv_lay.addLayout(timeout_row)
+        timeout_lay.addWidget(self.timeout_dropdown, 0, Qt.AlignmentFlag.AlignVCenter)
+        adv_lay.addWidget(timeout_box)
 
         self.adv_container.setVisible(False)
         opt_lay.addWidget(self.adv_container)
-        lay.addWidget(self.options_card)
+
+        self._list_layout.addWidget(self.options_card)
+        self._list_layout.addStretch(1)
+
+        self.scroll.setWidget(self._list_host)
+        self.stack.addWidget(self.scroll)
+
+        lay.addWidget(self.stack, 1)
 
         ctrl_row = QtWidgets.QHBoxLayout()
         ctrl_row.setContentsMargins(0, 2, 0, 0)
-        self.verify_checkbox = MaterialCheckbox("Verify drive after writing", self)
+        ctrl_row.setSpacing(12)
+        self.verify_checkbox = MaterialCheckbox("Verify drive", self)
+        self.verify_checkbox.setToolTip("Read back written disk sectors and verify checksum")
         self.verify_checkbox.setChecked(True)
-        self.hdd_checkbox = MaterialCheckbox("Show USB hard drives", self)
+        self.hdd_checkbox = MaterialCheckbox("Show hard drives", self)
+        self.hdd_checkbox.setToolTip("Show external USB hard disk drives alongside flash sticks")
         self.hdd_checkbox.toggled.connect(self.filter_toggled.emit)
         self.refresh_btn = IconButton("refresh", "Refresh", self)
         self.refresh_btn.clicked.connect(self.refresh_requested.emit)
@@ -430,13 +471,13 @@ class DrivePage(QtWidgets.QWidget):
         drv = self.selected_drive()
         has_cros = drv is not None and drv.has_chromeos
         is_togo = self.mode_dropdown.current_data() == "to_go"
-        self.keep_data_cb.setVisible(has_cros and is_togo)
+        self.keep_data_tile.setVisible(has_cros and is_togo)
         self.selection_changed.emit()
 
     def install_mode(self) -> str:
         data = self.mode_dropdown.current_data()
         if data == "to_go":
-            if self.keep_data_cb.isVisible() and self.keep_data_cb.isChecked():
+            if self.keep_data_tile.isVisible() and self.keep_data_tile.isChecked():
                 return "to_go_update"
             return "to_go_fresh"
         return "installer"
@@ -444,23 +485,23 @@ class DrivePage(QtWidgets.QWidget):
     def boot_options(self) -> ChromeOSBootOptions:
         t_val = int(self.timeout_dropdown.current_data() or 2)
         return ChromeOSBootOptions(
-            cros_debug=self.cros_debug_cb.isChecked(),
-            disable_auto_updates=self.disable_au_cb.isChecked(),
-            verbose_boot=self.verbose_cb.isChecked(),
+            cros_debug=self.cros_debug_tile.isChecked(),
+            disable_auto_updates=self.disable_au_tile.isChecked(),
+            verbose_boot=self.verbose_tile.isChecked(),
             timeout=t_val,
-            nomodeset=self.nomodeset_cb.isChecked(),
-            unencrypted_stateful=self.unencrypted_cb.isChecked(),
+            nomodeset=self.nomodeset_tile.isChecked(),
+            unencrypted_stateful=self.unencrypted_tile.isChecked(),
         )
 
     def verify_drive_checked(self) -> bool:
         return self.verify_checkbox.isChecked()
 
     def _reset_boot_options_to_defaults(self) -> None:
-        self.cros_debug_cb.setChecked(False)
-        self.disable_au_cb.setChecked(False)
-        self.verbose_cb.setChecked(False)
-        self.nomodeset_cb.setChecked(False)
-        self.unencrypted_cb.setChecked(False)
+        self.cros_debug_tile.setChecked(False)
+        self.disable_au_tile.setChecked(False)
+        self.verbose_tile.setChecked(False)
+        self.nomodeset_tile.setChecked(False)
+        self.unencrypted_tile.setChecked(False)
         self.timeout_dropdown.set_current_index(1)
 
     def selected_drive(self) -> Drive | None:
@@ -474,8 +515,8 @@ class DrivePage(QtWidgets.QWidget):
             return
         self._entries = list(entries)
 
-        while self._list_layout.count() > 1:
-            item = self._list_layout.takeAt(0)
+        while self._drives_layout.count() > 0:
+            item = self._drives_layout.takeAt(0)
             w = item.widget()
             if w is not None:
                 w.deleteLater()
@@ -494,10 +535,10 @@ class DrivePage(QtWidgets.QWidget):
         self.options_card.setVisible(True)
         for idx, entry in enumerate(entries):
             is_sel = entry.selectable and entry.drive.id == self._selected_id
-            card = DriveCard(entry, selected=is_sel, parent=self._list_host)
+            card = DriveCard(entry, selected=is_sel, parent=self._drives_box)
             dev_id = entry.drive.id
             card.clicked.connect(lambda d=dev_id: self._select(d))
-            self._list_layout.insertWidget(idx, card)
+            self._drives_layout.addWidget(card)
             self._cards.append(card)
 
         self.stack.setCurrentIndex(1)
@@ -514,8 +555,8 @@ class DrivePage(QtWidgets.QWidget):
         entry = next((e for e in self._entries if e.drive.id == dev_id), None)
         if entry and entry.drive.has_chromeos:
             self.mode_dropdown.set_current_index(1)
-            self.keep_data_cb.setVisible(True)
-            self.keep_data_cb.setChecked(True)
+            self.keep_data_tile.setVisible(True)
+            self.keep_data_tile.setChecked(True)
 
             opts = read_chromeos_boot_options(dev_id)
             if opts is None:
@@ -526,17 +567,17 @@ class DrivePage(QtWidgets.QWidget):
                     opts = sess.read_boot_options(dev_id)
 
             if opts is not None:
-                self.cros_debug_cb.setChecked(opts.cros_debug)
-                self.disable_au_cb.setChecked(opts.disable_auto_updates)
-                self.verbose_cb.setChecked(opts.verbose_boot)
-                self.nomodeset_cb.setChecked(opts.nomodeset)
-                self.unencrypted_cb.setChecked(opts.unencrypted_stateful)
+                self.cros_debug_tile.setChecked(opts.cros_debug)
+                self.disable_au_tile.setChecked(opts.disable_auto_updates)
+                self.verbose_tile.setChecked(opts.verbose_boot)
+                self.nomodeset_tile.setChecked(opts.nomodeset)
+                self.unencrypted_tile.setChecked(opts.unencrypted_stateful)
                 t_idx = {0: 0, 2: 1, 5: 2, 10: 3}.get(opts.timeout, 1)
                 self.timeout_dropdown.set_current_index(t_idx)
         else:
             self.mode_dropdown.set_current_index(0)
-            self.keep_data_cb.setVisible(False)
-            self.keep_data_cb.setChecked(False)
+            self.keep_data_tile.setVisible(False)
+            self.keep_data_tile.setChecked(False)
             self._reset_boot_options_to_defaults()
 
         self.selection_changed.emit()

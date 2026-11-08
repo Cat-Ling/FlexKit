@@ -304,18 +304,27 @@ class LinearProgress(QtWidgets.QWidget):
 
 
 class MaterialCheckbox(QtWidgets.QAbstractButton):
-    def __init__(self, text: str = "", parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(
+        self,
+        text: str = "",
+        parent: QtWidgets.QWidget | None = None,
+        *,
+        font_size: int = 13,
+    ) -> None:
         super().__init__(parent)
         self.setText(text)
         self.setCheckable(True)
         self._hovered = False
-        self.setFont(theme.make_font(15, QtGui.QFont.Weight.Normal))
+        self._kbd_focus = False
+        self.setFont(theme.make_font(font_size, QtGui.QFont.Weight.Normal))
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(38)
+        self.setFixedHeight(34)
 
     def sizeHint(self) -> QSize:
+        if not self.text():
+            return QSize(24, 34)
         fm = QtGui.QFontMetrics(self.font())
-        return QSize(38 + fm.horizontalAdvance(self.text()) + 8, 38)
+        return QSize(32 + fm.horizontalAdvance(self.text()) + 6, 34)
 
     def enterEvent(self, event: QtGui.QEnterEvent) -> None:
         self._hovered = True
@@ -345,12 +354,14 @@ class MaterialCheckbox(QtWidgets.QAbstractButton):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         cy = self.height() / 2.0
-        box = QRectF(7, cy - 10, 20, 20)
+        has_txt = bool(self.text())
+        box_x = 7.0 if has_txt else (self.width() - 20.0) / 2.0
+        box = QRectF(box_x, cy - 10.0, 20.0, 20.0)
 
         if self.isEnabled() and (self._hovered or self.hasFocus()):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(theme.color(theme.PRIMARY if self.isChecked() else theme.ON_SURFACE, 0.08))
-            p.drawEllipse(QPointF(17, cy), 17, 17)
+            p.drawEllipse(QPointF(box.center().x(), cy), 16.0, 16.0)
 
         if self.isChecked():
             p.setPen(Qt.PenStyle.NoPen)
@@ -362,10 +373,100 @@ class MaterialCheckbox(QtWidgets.QAbstractButton):
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRoundedRect(box, 4.0, 4.0)
 
-        p.setPen(theme.color(theme.ON_SURFACE if self.isEnabled() else theme.OUTLINE))
-        p.setFont(self.font())
-        text_rect = QRectF(36, 0, max(0.0, self.width() - 36.0), float(self.height()))
-        p.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
+        if has_txt:
+            p.setPen(theme.color(theme.ON_SURFACE if self.isEnabled() else theme.OUTLINE))
+            p.setFont(self.font())
+            fm = QtGui.QFontMetrics(self.font())
+            text_rect = QRectF(32, 0, max(0.0, self.width() - 32.0), float(self.height()))
+            elided = fm.elidedText(self.text(), Qt.TextElideMode.ElideRight, int(text_rect.width()))
+            p.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided)
+        p.end()
+
+
+class BootOptionTile(QtWidgets.QFrame):
+    toggled = Signal(bool)
+
+    def __init__(
+        self,
+        title: str,
+        description: str,
+        checked: bool = False,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._checked = checked
+        self._hovered = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Minimum)
+
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(12)
+
+        self.checkbox = MaterialCheckbox("", self)
+        self.checkbox.setFixedSize(24, 24)
+        self.checkbox.setChecked(checked)
+        self.checkbox.toggled.connect(self._on_cb_toggled)
+        lay.addWidget(self.checkbox, 0, Qt.AlignmentFlag.AlignTop)
+
+        text_lay = QtWidgets.QVBoxLayout()
+        text_lay.setContentsMargins(0, 0, 0, 0)
+        text_lay.setSpacing(2)
+
+        self.title_lbl = QtWidgets.QLabel(title, self)
+        self.title_lbl.setFont(theme.make_font(14, QtGui.QFont.Weight.Medium))
+        self.title_lbl.setStyleSheet(f"color: {theme.ON_SURFACE}; background: transparent;")
+        text_lay.addWidget(self.title_lbl)
+
+        self.desc_lbl = QtWidgets.QLabel(description, self)
+        self.desc_lbl.setFont(theme.make_font(12, QtGui.QFont.Weight.Normal))
+        self.desc_lbl.setStyleSheet(f"color: {theme.ON_SURFACE_VARIANT}; background: transparent;")
+        self.desc_lbl.setWordWrap(True)
+        text_lay.addWidget(self.desc_lbl)
+
+        lay.addLayout(text_lay, 1)
+
+    def isChecked(self) -> bool:
+        return self.checkbox.isChecked()
+
+    def setChecked(self, checked: bool) -> None:
+        self.checkbox.setChecked(checked)
+        self.update()
+
+    def _on_cb_toggled(self, checked: bool) -> None:
+        self._checked = checked
+        self.update()
+        self.toggled.emit(checked)
+
+    def enterEvent(self, event: QtGui.QEnterEvent) -> None:
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QtGui.QEvent) -> None:
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.checkbox.toggle()
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.checkbox.toggle()
+            return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, _event: QtGui.QPaintEvent) -> None:
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        if self._hovered or self.hasFocus():
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(theme.color(theme.SURFACE_CONTAINER_HIGH if self._hovered else theme.SURFACE_CONTAINER))
+            p.drawRoundedRect(QRectF(0, 0, self.width(), self.height()), 8.0, 8.0)
         p.end()
 
 
