@@ -228,3 +228,58 @@ Providers:
     filtered = filter_drives(drives, include_usb_hdd=False, min_size=9523261952)
     assert [e.drive.id for e in filtered] == ["/dev/da0"]
     assert filtered[0].drive.serial == "4C53100999"
+
+
+def test_linux_lsblk_togo_vs_installer_detection() -> None:
+    payload = {
+        "blockdevices": [
+            {
+                "name": "sde",
+                "path": "/dev/sde",
+                "size": 31914983424,
+                "vendor": "SanDisk",
+                "model": "Ultra",
+                "serial": "TOGO1",
+                "tran": "usb",
+                "rm": True,
+                "hotplug": True,
+                "ro": False,
+                "type": "disk",
+                "mountpoints": [],
+                "children": [
+                    {"name": "sde1", "path": "/dev/sde1", "size": 20000000000, "type": "part", "partlabel": "STATE"},
+                    {"name": "sde2", "path": "/dev/sde2", "size": 67108864, "type": "part", "partlabel": "KERN-A"},
+                    {"name": "sde3", "path": "/dev/sde3", "size": 4294967296, "type": "part", "partlabel": "ROOT-A"},
+                    {"name": "sde4", "path": "/dev/sde4", "size": 67108864, "type": "part", "partlabel": "KERN-B"},
+                    {"name": "sde5", "path": "/dev/sde5", "size": 4294967296, "type": "part", "partlabel": "ROOT-B"},
+                    {"name": "sde12", "path": "/dev/sde12", "size": 268435456, "type": "part", "partlabel": "EFI-SYSTEM"},
+                ],
+            },
+            {
+                "name": "sdf",
+                "path": "/dev/sdf",
+                "size": 31914983424,
+                "vendor": "SanDisk",
+                "model": "Installer",
+                "serial": "INST1",
+                "tran": "usb",
+                "rm": True,
+                "hotplug": True,
+                "ro": False,
+                "type": "disk",
+                "mountpoints": [],
+                "children": [
+                    {"name": "sdf1", "path": "/dev/sdf1", "size": 6448742400, "type": "part", "partlabel": "STATE"},
+                    {"name": "sdf2", "path": "/dev/sdf2", "size": 67108864, "type": "part", "partlabel": "KERN-A"},
+                    {"name": "sdf3", "path": "/dev/sdf3", "size": 2516582400, "type": "part", "partlabel": "ROOT-A"},
+                    {"name": "sdf4", "path": "/dev/sdf4", "size": 67108864, "type": "part", "partlabel": "KERN-B"},
+                    {"name": "sdf5", "path": "/dev/sdf5", "size": 2097152, "type": "part", "partlabel": "ROOT-B"},
+                    {"name": "sdf12", "path": "/dev/sdf12", "size": 268435456, "type": "part", "partlabel": "EFI-SYSTEM"},
+                ],
+            },
+        ]
+    }
+    drives = parse_lsblk_json(json.dumps(payload))
+    by_id = {d.id: d for d in drives}
+    assert by_id["/dev/sde"].has_chromeos is True
+    assert by_id["/dev/sdf"].has_chromeos is False

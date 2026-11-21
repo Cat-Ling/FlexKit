@@ -18,7 +18,6 @@ import threading
 import time
 
 from flexkit.writer import WriteCancelled, WriteError, WriteProgressCallback, WriteSpec
-from flexkit.writer.gpt import ChromeOSBootOptions
 
 log = logging.getLogger("flexkit.privilege")
 
@@ -270,10 +269,18 @@ def _spawn_windows_uac(cmd: list[str], extra_env: dict[str, str]) -> tuple[Calla
     sei.lpParameters = params
     sei.nShow = 0
 
-    shell32 = ctypes.windll.shell32
-    kernel32 = ctypes.windll.kernel32
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32.ShellExecuteExW.argtypes = [ctypes.c_void_p]
+    shell32.ShellExecuteExW.restype = wintypes.BOOL
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
     if not shell32.ShellExecuteExW(ctypes.byref(sei)):
-        err = kernel32.GetLastError()
+        err = ctypes.get_last_error()
         if err == 1223:
             raise ElevationCancelled()
         raise ElevationError(f"Administrator elevation failed (code {err}).")
@@ -400,61 +407,6 @@ class PrivilegedSession:
                         raise WriteCancelled()
                     raise WriteError("Privileged writer terminated unexpectedly.")
                 buf += chunk
-
-    def read_boot_options(self, device: str) -> ChromeOSBootOptions | None:
-        with self._lock:
-            if not self.is_alive():
-                return None
-            try:
-                cmd = {"cmd": "read_boot_options", "device": device}
-                self._conn.sendall((json.dumps(cmd) + "\n").encode("utf-8"))
-                buf = self._buf
-                start_t = time.monotonic()
-                while time.monotonic() - start_t < 10.0:
-                    while b"\n" in buf:
-                        raw_line, buf = buf.split(b"\n", 1)
-                        if not raw_line.strip():
-                            continue
-                        msg = json.loads(raw_line.decode("utf-8"))
-                        if msg.get("event") == "boot_options":
-                            self._buf = buf
-                            opts_d = msg.get("options")
-                            return ChromeOSBootOptions.from_dict(opts_d) if opts_d else None
-                    chunk = self._conn.recv(4096)
-                    if not chunk:
-                        self._alive = False
-                        return None
-                    buf += chunk
-                return None
-            except Exception:
-                return None
-
-    def patch_boot_options(self, device: str, options: ChromeOSBootOptions) -> bool:
-        with self._lock:
-            if not self.is_alive():
-                return False
-            try:
-                cmd = {"cmd": "patch_boot_options", "device": device, "options": options.to_dict()}
-                self._conn.sendall((json.dumps(cmd) + "\n").encode("utf-8"))
-                buf = self._buf
-                start_t = time.monotonic()
-                while time.monotonic() - start_t < 10.0:
-                    while b"\n" in buf:
-                        raw_line, buf = buf.split(b"\n", 1)
-                        if not raw_line.strip():
-                            continue
-                        msg = json.loads(raw_line.decode("utf-8"))
-                        if msg.get("event") == "boot_options_patched":
-                            self._buf = buf
-                            return bool(msg.get("ok"))
-                    chunk = self._conn.recv(4096)
-                    if not chunk:
-                        self._alive = False
-                        return False
-                    buf += chunk
-                return False
-            except Exception:
-                return False
 
     def close(self) -> None:
         with self._lock:

@@ -18,7 +18,6 @@ from flexkit.ui.widgets import (
     PathSelector,
     TextButton,
 )
-from flexkit.writer.gpt import ChromeOSBootOptions, read_chromeos_boot_options
 
 
 class SurfaceCard(QtWidgets.QFrame):
@@ -332,6 +331,15 @@ class DrivePage(QtWidgets.QWidget):
         self.mode_dropdown.changed.connect(self._on_mode_changed)
         opt_lay.addWidget(self.mode_dropdown)
 
+        self.mode_desc = QtWidgets.QLabel(
+            "Creates a standard ChromeOS Flex USB installer to try or install on a PC's internal drive.",
+            self.options_card,
+        )
+        self.mode_desc.setWordWrap(True)
+        self.mode_desc.setFont(theme.make_font(12, QtGui.QFont.Weight.Normal))
+        self.mode_desc.setStyleSheet(f"color: {theme.ON_SURFACE_VARIANT}; background: transparent; padding: 0 2px;")
+        opt_lay.addWidget(self.mode_desc)
+
         self.keep_data_tile = BootOptionTile(
             "Keep existing user data (Update OS only)",
             "Preserves user accounts, local files, and apps in the stateful partition; updates OS partitions only.",
@@ -353,93 +361,21 @@ class DrivePage(QtWidgets.QWidget):
         adv_lay.setContentsMargins(0, 4, 0, 4)
         adv_lay.setSpacing(6)
 
-        self.cros_debug_tile = BootOptionTile(
-            "Developer Shell (cros_debug)",
-            "Enables root terminal on VT-2 (Ctrl+Alt+F2) and unlocks the 'shell' command in Crosh (Ctrl+Alt+T).",
+        self.flexshim_tile = BootOptionTile(
+            "Fix UEFI Boot Panic on Older PCs (flexshim)",
+            "Installs the flexshim UEFI compatibility shim on the EFI partition to fix crdyboot revocation errors and 'RefCell already borrowed' panics on early UEFI 2.0 PCs (e.g., 2nd Gen Intel). Requires Secure Boot disabled.",
             parent=self.adv_container,
         )
-        adv_lay.addWidget(self.cros_debug_tile)
-        self.cros_debug_cb = self.cros_debug_tile
+        self.flexshim_tile.toggled.connect(self._on_flexshim_toggled)
+        adv_lay.addWidget(self.flexshim_tile)
 
-        self.disable_au_tile = BootOptionTile(
+        self.block_updates_tile = BootOptionTile(
             "Disable Automatic Updates",
-            "Prevents background OTA updates from running on this USB drive so you can manage upgrades manually.",
+            "Sets block_updates=true in flexshim.cfg to block background ChromeOS Flex OTA updates without modifying OS partitions (requires flexshim; also enables crosh shell/VT2).",
             parent=self.adv_container,
         )
-        adv_lay.addWidget(self.disable_au_tile)
-        self.disable_au_cb = self.disable_au_tile
-
-        self.verbose_tile = BootOptionTile(
-            "Verbose Boot Diagnostics",
-            "Removes quiet splash and prints kernel driver initialization logs to screen (tty1) to diagnose boot hangs.",
-            parent=self.adv_container,
-        )
-        adv_lay.addWidget(self.verbose_tile)
-        self.verbose_cb = self.verbose_tile
-
-        self.nomodeset_tile = BootOptionTile(
-            "Legacy Graphics Mode (nomodeset)",
-            "Disables early kernel mode setting (replaces i915.modeset=1 with nomodeset). Fixes black screen on older GPUs.",
-            parent=self.adv_container,
-        )
-        adv_lay.addWidget(self.nomodeset_tile)
-        self.nomodeset_cb = self.nomodeset_tile
-
-        self.unencrypted_tile = BootOptionTile(
-            "Fast USB I/O (Unencrypted Stateful)",
-            "Bypasses user data partition encryption for faster read/write throughput on USB flash drives.",
-            parent=self.adv_container,
-        )
-        adv_lay.addWidget(self.unencrypted_tile)
-        self.unencrypted_cb = self.unencrypted_tile
-
-        self.force_legacy_tile = BootOptionTile(
-            "Force Legacy Boot (BIOS / CSM)",
-            "Disables UEFI crdyboot and forces legacy Syslinux booting. Fixes 'RefCell already borrowed' crashes on 2nd Gen Intel PCs.",
-            parent=self.adv_container,
-        )
-        adv_lay.addWidget(self.force_legacy_tile)
-        self.force_legacy_cb = self.force_legacy_tile
-
-        timeout_box = QtWidgets.QFrame(self.adv_container)
-        timeout_lay = QtWidgets.QHBoxLayout(timeout_box)
-        timeout_lay.setContentsMargins(10, 8, 10, 8)
-        timeout_lay.setSpacing(12)
-
-        timeout_text_lay = QtWidgets.QVBoxLayout()
-        timeout_text_lay.setContentsMargins(0, 0, 0, 0)
-        timeout_text_lay.setSpacing(2)
-
-        timeout_title = QtWidgets.QLabel("Boot Menu Timeout", timeout_box)
-        timeout_title.setFont(theme.make_font(14, QtGui.QFont.Weight.Medium))
-        timeout_title.setStyleSheet(f"color: {theme.ON_SURFACE}; background: transparent;")
-        timeout_text_lay.addWidget(timeout_title)
-
-        timeout_desc = QtWidgets.QLabel(
-            "Duration the GRUB boot menu displays before auto-booting default kernel.",
-            timeout_box,
-        )
-        timeout_desc.setFont(theme.make_font(12, QtGui.QFont.Weight.Normal))
-        timeout_desc.setStyleSheet(f"color: {theme.ON_SURFACE_VARIANT}; background: transparent;")
-        timeout_desc.setWordWrap(True)
-        timeout_text_lay.addWidget(timeout_desc)
-
-        timeout_lay.addLayout(timeout_text_lay, 1)
-
-        self.timeout_dropdown = OutlinedDropdown("Timeout", timeout_box)
-        self.timeout_dropdown.setFixedWidth(160)
-        self.timeout_dropdown.setFixedHeight(48)
-        self.timeout_dropdown.set_items(
-            [
-                ("0s (Instant)", 0),
-                ("2s (Default)", 2),
-                ("5s", 5),
-                ("10s", 10),
-            ],
-            current_index=1,
-        )
-        timeout_lay.addWidget(self.timeout_dropdown, 0, Qt.AlignmentFlag.AlignVCenter)
-        adv_lay.addWidget(timeout_box)
+        self.block_updates_tile.toggled.connect(self._on_block_updates_toggled)
+        adv_lay.addWidget(self.block_updates_tile)
 
         self.adv_container.setVisible(False)
         opt_lay.addWidget(self.adv_container)
@@ -470,17 +406,42 @@ class DrivePage(QtWidgets.QWidget):
         ctrl_row.addWidget(self.refresh_btn, 0)
         lay.addLayout(ctrl_row)
 
-    def _toggle_advanced_options(self) -> None:
-        vis = not self.adv_container.isVisible()
-        self.adv_container.setVisible(vis)
-        self.adv_btn.setText("▾ Advanced Boot Options" if vis else "▸ Advanced Boot Options")
-
     def _on_mode_changed(self, _idx: int) -> None:
         drv = self.selected_drive()
         has_cros = drv is not None and drv.has_chromeos
         is_togo = self.mode_dropdown.current_data() == "to_go"
+        self.mode_desc.setText(
+            "Installs persistent ChromeOS Flex directly onto the USB drive with Verified Boot and full storage (16 GB+ recommended)."
+            if is_togo
+            else "Creates a standard ChromeOS Flex USB installer to try or install on a PC's internal drive."
+        )
         self.keep_data_tile.setVisible(has_cros and is_togo)
         self.selection_changed.emit()
+
+    def _toggle_advanced_options(self) -> None:
+        visible = not self.adv_container.isVisible()
+        self.adv_container.setVisible(visible)
+        self.adv_btn.setText("▾ Advanced Boot Options" if visible else "▸ Advanced Boot Options")
+
+    def _on_flexshim_toggled(self, checked: bool) -> None:
+        if not checked and self.block_updates_tile.isChecked():
+            self.block_updates_tile.blockSignals(True)
+            self.block_updates_tile.setChecked(False)
+            self.block_updates_tile.blockSignals(False)
+        self.selection_changed.emit()
+
+    def _on_block_updates_toggled(self, checked: bool) -> None:
+        if checked and not self.flexshim_tile.isChecked():
+            self.flexshim_tile.blockSignals(True)
+            self.flexshim_tile.setChecked(True)
+            self.flexshim_tile.blockSignals(False)
+        self.selection_changed.emit()
+
+    def install_flexshim_checked(self) -> bool:
+        return self.flexshim_tile.isChecked() or self.block_updates_tile.isChecked()
+
+    def block_updates_checked(self) -> bool:
+        return self.block_updates_tile.isChecked()
 
     def install_mode(self) -> str:
         data = self.mode_dropdown.current_data()
@@ -490,29 +451,8 @@ class DrivePage(QtWidgets.QWidget):
             return "to_go_fresh"
         return "installer"
 
-    def boot_options(self) -> ChromeOSBootOptions:
-        t_val = int(self.timeout_dropdown.current_data() or 2)
-        return ChromeOSBootOptions(
-            cros_debug=self.cros_debug_tile.isChecked(),
-            disable_auto_updates=self.disable_au_tile.isChecked(),
-            verbose_boot=self.verbose_tile.isChecked(),
-            timeout=t_val,
-            nomodeset=self.nomodeset_tile.isChecked(),
-            unencrypted_stateful=self.unencrypted_tile.isChecked(),
-            force_legacy_boot=self.force_legacy_tile.isChecked(),
-        )
-
     def verify_drive_checked(self) -> bool:
         return self.verify_checkbox.isChecked()
-
-    def _reset_boot_options_to_defaults(self) -> None:
-        self.cros_debug_tile.setChecked(False)
-        self.disable_au_tile.setChecked(False)
-        self.verbose_tile.setChecked(False)
-        self.nomodeset_tile.setChecked(False)
-        self.unencrypted_tile.setChecked(False)
-        self.force_legacy_tile.setChecked(False)
-        self.timeout_dropdown.set_current_index(1)
 
     def selected_drive(self) -> Drive | None:
         for entry in self._entries:
@@ -567,29 +507,10 @@ class DrivePage(QtWidgets.QWidget):
             self.mode_dropdown.set_current_index(1)
             self.keep_data_tile.setVisible(True)
             self.keep_data_tile.setChecked(True)
-
-            opts = read_chromeos_boot_options(dev_id)
-            if opts is None:
-                from flexkit.privilege import get_active_privileged_session
-
-                sess = get_active_privileged_session()
-                if sess is not None:
-                    opts = sess.read_boot_options(dev_id)
-
-            if opts is not None:
-                self.cros_debug_tile.setChecked(opts.cros_debug)
-                self.disable_au_tile.setChecked(opts.disable_auto_updates)
-                self.verbose_tile.setChecked(opts.verbose_boot)
-                self.nomodeset_tile.setChecked(opts.nomodeset)
-                self.unencrypted_tile.setChecked(opts.unencrypted_stateful)
-                self.force_legacy_tile.setChecked(opts.force_legacy_boot)
-                t_idx = {0: 0, 2: 1, 5: 2, 10: 3}.get(opts.timeout, 1)
-                self.timeout_dropdown.set_current_index(t_idx)
         else:
             self.mode_dropdown.set_current_index(0)
             self.keep_data_tile.setVisible(False)
             self.keep_data_tile.setChecked(False)
-            self._reset_boot_options_to_defaults()
 
         self.selection_changed.emit()
 
@@ -597,23 +518,6 @@ class DrivePage(QtWidgets.QWidget):
 class DonePage(QtWidgets.QWidget):
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
-        self._lay = QtWidgets.QVBoxLayout(self)
-        self._lay.setContentsMargins(0, 0, 0, 0)
-        self._lay.setSpacing(12)
-        self._lay.addWidget(OobeIllustration("done", self), 1)
-
-        self.legacy_banner = Banner("warning", self)
-        self.legacy_banner.setVisible(False)
-        self._lay.addWidget(self.legacy_banner, 0, Qt.AlignmentFlag.AlignHCenter)
-
-    def set_legacy_warning(self, legacy_forced: bool, auto_updates_enabled: bool) -> None:
-        if legacy_forced:
-            if auto_updates_enabled:
-                self.legacy_banner.show_message(
-                    "Legacy Boot Mode enabled. If auto-updates remain on, keep an eye on future ChromeOS updates on older BIOS hardware."
-                )
-            else:
-                self.legacy_banner.show_message("Legacy Boot Mode enabled. Boot your PC using Legacy BIOS / CSM mode.")
-            self.legacy_banner.setVisible(True)
-        else:
-            self.legacy_banner.setVisible(False)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(OobeIllustration("done", self), 1)

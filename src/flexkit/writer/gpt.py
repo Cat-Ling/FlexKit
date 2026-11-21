@@ -1,9 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-import os
 from pathlib import Path
-import re
 import struct
 from typing import BinaryIO
 import uuid
@@ -14,6 +13,13 @@ GPT_HEADER_SIZE = 92
 GPT_NUM_ENTRIES = 128
 GPT_ENTRY_SIZE = 128
 
+TWO_MIB_SECTORS = (2 * 1024 * 1024) // SECTOR_SIZE
+ROOTFS_MIN_SECTORS = (4 * 1024 * 1024 * 1024) // SECTOR_SIZE
+STATE_GAP_SECTORS = (128 * 1024 * 1024) // SECTOR_SIZE
+TAIL_RESERVED_SECTORS = 24576 // SECTOR_SIZE
+MIN_TOGO_STATE_SECTORS = (2 * 1024 * 1024 * 1024) // SECTOR_SIZE
+MIN_TOGO_ROOT_SECTORS = (2 * 1024 * 1024 * 1024) // SECTOR_SIZE
+
 CHROMEOS_KERN_TYPE = uuid.UUID("fe3a2a5d-4f32-41a7-b725-accc3285a309")
 CHROMEOS_ROOT_TYPE = uuid.UUID("3cb8e202-3b7e-47dd-8a3c-7ff2a13cfcec")
 CHROMEOS_STATE_TYPE = uuid.UUID("0fc63daf-8483-4772-8e79-3d69d8477de4")
@@ -21,8 +27,9 @@ EFI_SYSTEM_TYPE = uuid.UUID("c12a7328-f81f-11d2-ba4b-00a0c93ec93b")
 CHROMEOS_RWFW_TYPE = uuid.UUID("cab6e88e-abf3-4102-a07a-d4bb9be3c1d3")
 CHROMEOS_RESERVED_TYPE = uuid.UUID("2e0a753d-9e48-43b0-8337-b15192cb1b5e")
 
-ROOT_A_UNIQUE_UUID = uuid.UUID("fdecd5e5-f2f2-ce47-852b-3839e867212b")
-ROOT_B_UNIQUE_UUID = uuid.UUID("c99b551e-01ac-7345-864f-a9fdbd74f6c1")
+KERN_A_INSTALL_FLAGS = (15 << 48) | (15 << 52)
+KERN_INACTIVE_FLAGS = 15 << 52
+EFI_LEGACY_BOOT_FLAG = 1 << 2
 
 CHROMEOS_HYBRID_MBR_CODE = (
     b"3\xc0\xfa\x8e\xd8\x8e\xd0\xbc\x00|\x89\xe6\x06W\x8e\xc0\xfb\xfc\xbf\x00\x06\xb9\x00\x01\xf3\xa5\xea\x1f\x06\x00\x00"
@@ -80,54 +87,36 @@ class GptTable:
         has_efi = any(p.name.upper() == "EFI-SYSTEM" and p.type_guid == EFI_SYSTEM_TYPE for p in self.partitions)
         return has_state and has_kern and has_root and has_efi
 
-
-@dataclass(frozen=True, slots=True)
-class ChromeOSBootOptions:
-    cros_debug: bool = False
-    disable_auto_updates: bool = False
-    verbose_boot: bool = False
-    timeout: int = 2
-    nomodeset: bool = False
-    unencrypted_stateful: bool = False
-    force_legacy_boot: bool = False
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "cros_debug": self.cros_debug,
-            "disable_auto_updates": self.disable_auto_updates,
-            "verbose_boot": self.verbose_boot,
-            "timeout": self.timeout,
-            "nomodeset": self.nomodeset,
-            "unencrypted_stateful": self.unencrypted_stateful,
-            "force_legacy_boot": self.force_legacy_boot,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, object]) -> ChromeOSBootOptions:
-        return cls(
-            cros_debug=bool(data.get("cros_debug")),
-            disable_auto_updates=bool(data.get("disable_auto_updates")),
-            verbose_boot=bool(data.get("verbose_boot")),
-            timeout=int(data.get("timeout") or 2),
-            nomodeset=bool(data.get("nomodeset")),
-            unencrypted_stateful=bool(data.get("unencrypted_stateful")),
-            force_legacy_boot=bool(data.get("force_legacy_boot")),
+    @property
+    def is_chromeos_togo(self) -> bool:
+        if not self.is_chromeos:
+            return False
+        root_a = self.get_by_name("ROOT-A")
+        root_b = self.get_by_name("ROOT-B")
+        kern_a = self.get_by_name("KERN-A")
+        kern_b = self.get_by_name("KERN-B")
+        state = self.get_by_name("STATE")
+        efi = self.get_by_name("EFI-SYSTEM")
+        if root_a is None or root_b is None or kern_a is None or kern_b is None or state is None or efi is None:
+            return False
+        # ChromeOS is_running_from_installer treats equal ROOT-A/ROOT-B sizes as an installed disk.
+        return (
+            root_a.sector_count == root_b.sector_count
+            and root_a.sector_count >= MIN_TOGO_ROOT_SECTORS
+            and state.start_lba > max(root_a.end_lba, root_b.end_lba)
         )
 
 
-def read_gpt_table(stream: BinaryIO) -> GptTable | None:
-    stream.seek(SECTOR_SIZE)
-    hdr_bytes = stream.read(SECTOR_SIZE)
+def _unpack_gpt_header(hdr_bytes: bytes) -> tuple[int, int, int, int, int, uuid.UUID, int, int, int] | None:
     if len(hdr_bytes) < SECTOR_SIZE or hdr_bytes[:8] != b"EFI PART":
         return None
-
     try:
         (
-            sig,
-            rev,
+            _sig,
+            _rev,
             hdr_sz,
-            hdr_crc,
-            res,
+            _hdr_crc,
+            _res,
             current_lba,
             backup_lba,
             first_usable,
@@ -136,22 +125,36 @@ def read_gpt_table(stream: BinaryIO) -> GptTable | None:
             entry_lba,
             num_entries,
             entry_sz,
-            entry_crc,
+            _entry_crc,
         ) = struct.unpack_from("<8sIIIIQQQQ16sQIII", hdr_bytes, 0)
     except struct.error:
         return None
-
     if hdr_sz < GPT_HEADER_SIZE or entry_sz != GPT_ENTRY_SIZE:
         return None
+    return (
+        current_lba,
+        backup_lba,
+        first_usable,
+        last_usable,
+        entry_lba,
+        uuid.UUID(bytes_le=disk_guid_raw),
+        num_entries,
+        entry_sz,
+        hdr_sz,
+    )
 
-    stream.seek(entry_lba * SECTOR_SIZE)
-    raw_entries = stream.read(num_entries * entry_sz)
-    if len(raw_entries) < num_entries * entry_sz:
-        return None
 
-    disk_guid = uuid.UUID(bytes_le=disk_guid_raw)
+def _parse_gpt_table(
+    current_lba: int,
+    backup_lba: int,
+    first_usable: int,
+    last_usable: int,
+    disk_guid: uuid.UUID,
+    num_entries: int,
+    entry_sz: int,
+    raw_entries: bytes,
+) -> GptTable:
     partitions: list[GptPartition] = []
-
     for idx in range(num_entries):
         off = idx * entry_sz
         t_guid, u_guid, s_lba, e_lba, flags, name_raw = struct.unpack_from("<16s16sQQQ72s", raw_entries, off)
@@ -169,7 +172,6 @@ def read_gpt_table(stream: BinaryIO) -> GptTable | None:
                 flags=flags,
             )
         )
-
     return GptTable(
         disk_guid=disk_guid,
         total_sectors=backup_lba + 1 if backup_lba > current_lba else current_lba + 1,
@@ -177,6 +179,35 @@ def read_gpt_table(stream: BinaryIO) -> GptTable | None:
         last_usable_lba=last_usable,
         partitions=tuple(partitions),
     )
+
+
+def read_gpt_table_from_bytes(header_and_entries: bytes) -> GptTable | None:
+    if len(header_and_entries) < 2 * SECTOR_SIZE:
+        return None
+    hdr = _unpack_gpt_header(header_and_entries[SECTOR_SIZE : 2 * SECTOR_SIZE])
+    if hdr is None:
+        return None
+    current_lba, backup_lba, first_usable, last_usable, entry_lba, disk_guid, num_entries, entry_sz, _ = hdr
+    entries_off = entry_lba * SECTOR_SIZE
+    entries_len = num_entries * entry_sz
+    if entries_off + entries_len > len(header_and_entries):
+        return None
+    raw_entries = header_and_entries[entries_off : entries_off + entries_len]
+    return _parse_gpt_table(current_lba, backup_lba, first_usable, last_usable, disk_guid, num_entries, entry_sz, raw_entries)
+
+
+def read_gpt_table(stream: BinaryIO) -> GptTable | None:
+    stream.seek(SECTOR_SIZE)
+    hdr_bytes = stream.read(SECTOR_SIZE)
+    hdr = _unpack_gpt_header(hdr_bytes)
+    if hdr is None:
+        return None
+    current_lba, backup_lba, first_usable, last_usable, entry_lba, disk_guid, num_entries, entry_sz, _ = hdr
+    stream.seek(entry_lba * SECTOR_SIZE)
+    raw_entries = stream.read(num_entries * entry_sz)
+    if len(raw_entries) < num_entries * entry_sz:
+        return None
+    return _parse_gpt_table(current_lba, backup_lba, first_usable, last_usable, disk_guid, num_entries, entry_sz, raw_entries)
 
 
 def is_chromeos_drive(path_or_device: Path | str) -> bool:
@@ -188,33 +219,51 @@ def is_chromeos_drive(path_or_device: Path | str) -> bool:
         return False
 
 
+def is_chromeos_togo_drive(path_or_device: Path | str) -> bool:
+    try:
+        with open(path_or_device, "rb") as fh:
+            table = read_gpt_table(fh)
+            return table is not None and table.is_chromeos_togo
+    except (OSError, PermissionError):
+        return False
+
+
 def build_protective_mbr(
     total_sectors: int,
     boot_code: bytes | None = None,
     efi_lba: int = 299008,
     efi_sectors: int = 524288,
 ) -> bytes:
+    _ = total_sectors
     mbr = bytearray(SECTOR_SIZE)
     code = boot_code if boot_code is not None else CHROMEOS_HYBRID_MBR_CODE
     mbr[: min(len(code), 446)] = code[:446]
 
-    # Entry 1: Partition 12 (EFI-SYSTEM), active/bootable for Syslinux legacy boot
+    # Entry 1: Partition 12 (EFI-SYSTEM), active/bootable for legacy Syslinux boot.
     mbr[446:462] = struct.pack(
         "<BBBBBBBBII",
         0x80,
-        0, 0, 0,
+        0,
+        0,
+        0,
         0x0C,
-        0xFF, 0xFF, 0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
         efi_lba,
         efi_sectors,
     )
-    # Entry 2: GPT protective entry covering disk
+    # Entry 2: GPT protective entry.
     mbr[462:478] = struct.pack(
         "<BBBBBBBBII",
         0x00,
-        0, 2, 0,
+        0,
+        2,
+        0,
         0xEE,
-        0xFF, 0xFF, 0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
         1,
         1,
     )
@@ -224,7 +273,7 @@ def build_protective_mbr(
 
 def serialize_gpt(
     total_sectors: int,
-    partitions: list[tuple[int, str, uuid.UUID, uuid.UUID, int, int, int]],
+    partitions: Sequence[GptPartition | tuple[int, str, uuid.UUID, uuid.UUID, int, int, int]],
     disk_guid: uuid.UUID | None = None,
 ) -> tuple[bytes, bytes, bytes]:
     first_usable = 34
@@ -232,7 +281,18 @@ def serialize_gpt(
     d_guid = disk_guid or uuid.uuid4()
 
     entries = bytearray(GPT_NUM_ENTRIES * GPT_ENTRY_SIZE)
-    for p_num, p_name, t_guid, u_guid, s_lba, e_lba, flags in partitions:
+    for part in partitions:
+        if isinstance(part, GptPartition):
+            p_num = part.number
+            p_name = part.name
+            t_guid = part.type_guid
+            u_guid = part.unique_guid
+            s_lba = part.start_lba
+            e_lba = part.end_lba
+            flags = part.flags
+        else:
+            p_num, p_name, t_guid, u_guid, s_lba, e_lba, flags = part
+
         if 1 <= p_num <= GPT_NUM_ENTRIES:
             off = (p_num - 1) * GPT_ENTRY_SIZE
             name_encoded = p_name.encode("utf-16le").ljust(72, b"\x00")[:72]
@@ -295,249 +355,264 @@ def serialize_gpt(
     return bytes(primary_hdr), bytes(entries), bytes(backup_hdr)
 
 
-def generate_chromeos_togo_partitions(
-    total_sectors: int,
-) -> list[tuple[int, str, uuid.UUID, uuid.UUID, int, int, int]]:
-    last_usable = total_sectors - 34
-
-    kern_a_flags = (15 << 48) | (15 << 52) | (1 << 56)
-    kern_b_flags = 0
-
-    state_start_lba = 6004736
-    state_end_lba = last_usable
-
-    return [
-        (11, "RWFW", CHROMEOS_RWFW_TYPE, uuid.uuid4(), 64, 64, 0),
-        (6, "KERN-C", CHROMEOS_KERN_TYPE, uuid.uuid4(), 65, 65, 0),
-        (7, "ROOT-C", CHROMEOS_ROOT_TYPE, uuid.uuid4(), 66, 66, 0),
-        (9, "reserved", CHROMEOS_RESERVED_TYPE, uuid.uuid4(), 67, 67, 0),
-        (10, "reserved", CHROMEOS_RESERVED_TYPE, uuid.uuid4(), 68, 68, 0),
-        (2, "KERN-A", CHROMEOS_KERN_TYPE, uuid.UUID("4e556b56-dc0f-0440-b653-0cd6a63da650"), 69, 131140, kern_a_flags),
-        (4, "KERN-B", CHROMEOS_KERN_TYPE, uuid.UUID("5c9d2135-4510-1440-8863-a85e63f52328"), 131141, 262212, kern_b_flags),
-        (8, "OEM", CHROMEOS_STATE_TYPE, uuid.UUID("c19a8d91-cad4-114f-9e93-925e7bd55c45"), 266240, 299007, 0),
-        (12, "EFI-SYSTEM", EFI_SYSTEM_TYPE, uuid.UUID("0b8db5e7-0b7a-1c45-ad8d-2001a38f7fb7"), 299008, 823295, 4),
-        (5, "ROOT-B", CHROMEOS_ROOT_TYPE, ROOT_B_UNIQUE_UUID, 823296, 827391, 0),
-        (3, "ROOT-A", CHROMEOS_ROOT_TYPE, ROOT_A_UNIQUE_UUID, 827392, 5742591, 0),
-        (1, "STATE", CHROMEOS_STATE_TYPE, uuid.UUID("2d27eb8c-0505-7b43-9472-aec55afbf3f7"), state_start_lba, state_end_lba, 0),
-    ]
+def _align_up(value: int, alignment: int) -> int:
+    rem = value % alignment
+    return value if rem == 0 else value + (alignment - rem)
 
 
-def patch_grub_cfg(
-    content: str,
-    options: ChromeOSBootOptions,
-) -> str:
-    lines = content.splitlines()
-    out: list[str] = []
-    for line in lines:
-        if line.strip().startswith("set timeout="):
-            out.append(f"set timeout={options.timeout}")
-            continue
+def plan_chromeos_togo_layout(source_gpt: GptTable, total_sectors: int) -> list[GptPartition]:
+    if not source_gpt.is_chromeos:
+        raise ValueError("Source image does not contain a valid ChromeOS GPT layout.")
 
-        if "linux " in line and "vmlinuz" in line:
-            parts = line.split()
-            # cros_debug
-            if options.cros_debug and "cros_debug" not in parts:
-                idx = parts.index("cros_efi") if "cros_efi" in parts else len(parts)
-                parts.insert(idx + 1, "cros_debug")
-            elif not options.cros_debug and "cros_debug" in parts:
-                parts = [p for p in parts if p != "cros_debug"]
+    src_kern_a = source_gpt.get_by_name("KERN-A")
+    src_kern_b = source_gpt.get_by_name("KERN-B")
+    src_oem = source_gpt.get_by_name("OEM")
+    src_efi = source_gpt.get_by_name("EFI-SYSTEM")
+    src_root_a = source_gpt.get_by_name("ROOT-A")
+    src_root_b = source_gpt.get_by_name("ROOT-B")
+    src_state = source_gpt.get_by_name("STATE")
 
-            # verbose boot: remove quiet, add console=tty1 loglevel=7
-            if options.verbose_boot:
-                parts = [p for p in parts if p != "quiet"]
-                if "console=tty1" not in parts:
-                    parts.append("console=tty1")
-            else:
-                if "quiet" not in parts:
-                    parts.insert(2, "quiet")
-                parts = [p for p in parts if p != "console=tty1"]
+    if src_kern_a is None or src_kern_b is None or src_oem is None or src_efi is None or src_root_a is None:
+        raise ValueError("Source image is missing required ChromeOS partitions.")
 
-            # nomodeset
-            if options.nomodeset:
-                if "nomodeset" not in parts:
-                    parts.append("nomodeset")
-                parts = [p for p in parts if p != "i915.modeset=1"]
-            else:
-                parts = [p for p in parts if p != "nomodeset"]
-                if "i915.modeset=1" not in parts:
-                    parts.append("i915.modeset=1")
+    src_rwfw = source_gpt.get_by_num(11)
+    src_kern_c = source_gpt.get_by_num(6)
+    src_root_c = source_gpt.get_by_num(7)
+    src_res9 = source_gpt.get_by_num(9)
+    src_res10 = source_gpt.get_by_num(10)
 
-            out.append(" ".join(parts))
-            continue
+    curr = 64
+    planned: list[GptPartition] = []
 
-        out.append(line)
+    def add_seq(
+        num: int,
+        name: str,
+        type_guid: uuid.UUID,
+        unique_guid: uuid.UUID,
+        sectors: int,
+        flags: int = 0,
+    ) -> None:
+        nonlocal curr
+        planned.append(
+            GptPartition(
+                number=num,
+                name=name,
+                type_guid=type_guid,
+                unique_guid=unique_guid,
+                start_lba=curr,
+                end_lba=curr + sectors - 1,
+                flags=flags,
+            )
+        )
+        curr += sectors
 
-    return "\n".join(out) + "\n"
-
-
-def parse_grub_cfg_options(cfg_text: str) -> ChromeOSBootOptions:
-    cros_debug = "cros_debug" in cfg_text
-    verbose_boot = "quiet" not in cfg_text or "console=tty1" in cfg_text
-    nomodeset = "nomodeset" in cfg_text or "i915.modeset=0" in cfg_text
-    m = re.search(r"set timeout=(\d+)", cfg_text)
-    timeout = int(m.group(1)) if m else 2
-    return ChromeOSBootOptions(
-        cros_debug=cros_debug,
-        verbose_boot=verbose_boot,
-        timeout=timeout,
-        nomodeset=nomodeset,
+    add_seq(
+        11,
+        "RWFW",
+        CHROMEOS_RWFW_TYPE,
+        src_rwfw.unique_guid if src_rwfw else uuid.uuid4(),
+        src_rwfw.sector_count if src_rwfw and src_rwfw.sector_count > 0 else 1,
+    )
+    add_seq(
+        6,
+        "KERN-C",
+        CHROMEOS_KERN_TYPE,
+        src_kern_c.unique_guid if src_kern_c else uuid.uuid4(),
+        src_kern_c.sector_count if src_kern_c and src_kern_c.sector_count > 0 else 1,
+        KERN_INACTIVE_FLAGS,
+    )
+    add_seq(
+        7,
+        "ROOT-C",
+        CHROMEOS_ROOT_TYPE,
+        src_root_c.unique_guid if src_root_c else uuid.uuid4(),
+        src_root_c.sector_count if src_root_c and src_root_c.sector_count > 0 else 1,
+    )
+    add_seq(
+        9,
+        "reserved",
+        CHROMEOS_RESERVED_TYPE,
+        src_res9.unique_guid if src_res9 else uuid.uuid4(),
+        src_res9.sector_count if src_res9 and src_res9.sector_count > 0 else 1,
+    )
+    add_seq(
+        10,
+        "reserved",
+        CHROMEOS_RESERVED_TYPE,
+        src_res10.unique_guid if src_res10 else uuid.uuid4(),
+        src_res10.sector_count if src_res10 and src_res10.sector_count > 0 else 1,
     )
 
+    kern_a_secs = src_kern_a.sector_count
+    kern_b_secs = max(src_kern_b.sector_count, kern_a_secs)
+    add_seq(2, "KERN-A", CHROMEOS_KERN_TYPE, src_kern_a.unique_guid, kern_a_secs, KERN_A_INSTALL_FLAGS)
+    add_seq(4, "KERN-B", CHROMEOS_KERN_TYPE, src_kern_b.unique_guid, kern_b_secs, KERN_INACTIVE_FLAGS)
 
-def read_chromeos_boot_options(path_or_device: Path | str) -> ChromeOSBootOptions | None:
-    try:
-        with open(path_or_device, "rb") as fh:
-            table = read_gpt_table(fh)
-            if table is None or not table.is_chromeos:
-                return None
+    curr = _align_up(curr, TWO_MIB_SECTORS)
+    add_seq(8, "OEM", CHROMEOS_STATE_TYPE, src_oem.unique_guid, src_oem.sector_count)
+    add_seq(12, "EFI-SYSTEM", EFI_SYSTEM_TYPE, src_efi.unique_guid, src_efi.sector_count, EFI_LEGACY_BOOT_FLAG)
 
-            efi_part = table.get_by_name("EFI-SYSTEM")
-            if efi_part is None:
-                return None
+    curr = _align_up(curr, TWO_MIB_SECTORS)
+    rootfs_sectors = max(ROOTFS_MIN_SECTORS, _align_up(src_root_a.sector_count, TWO_MIB_SECTORS))
+    root_b_guid = src_root_b.unique_guid if src_root_b is not None else uuid.uuid4()
+    add_seq(5, "ROOT-B", CHROMEOS_ROOT_TYPE, root_b_guid, rootfs_sectors)
 
-            fh.seek(efi_part.start_lba * SECTOR_SIZE)
-            # Read first 16 MiB of EFI-SYSTEM where grub.cfg resides
-            efi_chunk = fh.read(min(efi_part.size_bytes, 16 * 1024 * 1024))
-            idx = efi_chunk.find(b"menuentry \"local image A\"")
-            if idx == -1:
-                idx = efi_chunk.find(b"menuentry \"verified image A\"")
-            if idx == -1:
-                return ChromeOSBootOptions()
+    curr = _align_up(curr, TWO_MIB_SECTORS)
+    add_seq(3, "ROOT-A", CHROMEOS_ROOT_TYPE, src_root_a.unique_guid, rootfs_sectors)
 
-            start_cfg = max(0, idx - 400)
-            end_cfg = min(len(efi_chunk), idx + 2500)
-            cfg_text = efi_chunk[start_cfg:end_cfg].decode("utf-8", errors="ignore")
-            opts = parse_grub_cfg_options(cfg_text)
+    curr = _align_up(curr + STATE_GAP_SECTORS, TWO_MIB_SECTORS)
+    state_start_lba = curr
+    state_end_lba = total_sectors - 1 - TAIL_RESERVED_SECTORS
+    state_sectors = state_end_lba - state_start_lba + 1
+    if state_end_lba > total_sectors - 34 or state_sectors < MIN_TOGO_STATE_SECTORS:
+        raise ValueError(
+            "Target drive is too small for ChromeOS To Go (requires at least 2 GiB free for user data after OS partitions)."
+        )
 
-            # Check STATE partition for flags
-            state_part = table.get_by_name("STATE")
-            disable_au = False
-            unenc = False
-            if state_part is not None:
-                fh.seek(state_part.start_lba * SECTOR_SIZE)
-                state_chunk = fh.read(min(state_part.size_bytes, 32 * 1024 * 1024))
-                if b"consumer-auto-update-disabled" in state_chunk:
-                    disable_au = True
-                if b".force_unencrypted_stateful" in state_chunk or b"encstateful_mount_option" in state_chunk:
-                    unenc = True
+    planned.append(
+        GptPartition(
+            number=1,
+            name="STATE",
+            type_guid=CHROMEOS_STATE_TYPE,
+            unique_guid=src_state.unique_guid if src_state is not None else uuid.uuid4(),
+            start_lba=state_start_lba,
+            end_lba=state_end_lba,
+            flags=0,
+        )
+    )
+    return planned
 
-            is_legacy_forced = (efi_chunk.find(b"BOOTX64 DIS") != -1 or efi_chunk.find(b"BOOTX64.DIS") != -1)
 
-            return ChromeOSBootOptions(
-                cros_debug=opts.cros_debug,
-                disable_auto_updates=disable_au,
-                verbose_boot=opts.verbose_boot,
-                timeout=opts.timeout,
-                nomodeset=opts.nomodeset,
-                unencrypted_stateful=unenc,
-                force_legacy_boot=is_legacy_forced,
+def plan_chromeos_togo_update(source_gpt: GptTable, target_gpt: GptTable) -> list[GptPartition]:
+    if not source_gpt.is_chromeos:
+        raise ValueError("Source image does not contain a valid ChromeOS GPT layout.")
+    if not target_gpt.is_chromeos_togo:
+        raise ValueError("Target drive does not have a valid ChromeOS To Go installation to update.")
+
+    src_kern = source_gpt.get_by_name("KERN-B") or source_gpt.get_by_name("KERN-A")
+    src_kern_a = source_gpt.get_by_name("KERN-A")
+    src_kern_b = source_gpt.get_by_name("KERN-B")
+    src_oem = source_gpt.get_by_name("OEM")
+    src_efi = source_gpt.get_by_name("EFI-SYSTEM")
+    src_root_a = source_gpt.get_by_name("ROOT-A")
+    src_root_b = source_gpt.get_by_name("ROOT-B")
+
+    dst_kern_a = target_gpt.get_by_name("KERN-A")
+    dst_kern_b = target_gpt.get_by_name("KERN-B")
+    dst_oem = target_gpt.get_by_name("OEM")
+    dst_efi = target_gpt.get_by_name("EFI-SYSTEM")
+    dst_root_a = target_gpt.get_by_name("ROOT-A")
+    dst_root_b = target_gpt.get_by_name("ROOT-B")
+    dst_state = target_gpt.get_by_name("STATE")
+
+    if (
+        src_kern is None
+        or src_kern_a is None
+        or src_kern_b is None
+        or src_oem is None
+        or src_efi is None
+        or src_root_a is None
+        or dst_kern_a is None
+        or dst_kern_b is None
+        or dst_oem is None
+        or dst_efi is None
+        or dst_root_a is None
+        or dst_root_b is None
+        or dst_state is None
+    ):
+        raise ValueError("Missing required ChromeOS partitions for To Go update.")
+
+    if dst_kern_a.sector_count < src_kern.sector_count or dst_kern_b.sector_count < src_kern.sector_count:
+        raise ValueError("Target KERN partitions are smaller than the source image.")
+    if dst_oem.sector_count < src_oem.sector_count:
+        raise ValueError("Target OEM partition is smaller than the source image.")
+    if dst_efi.sector_count < src_efi.sector_count:
+        raise ValueError("Target EFI-SYSTEM partition is smaller than the source image.")
+    if dst_root_a.sector_count < src_root_a.sector_count or dst_root_b.sector_count < src_root_a.sector_count:
+        raise ValueError("Target ROOT partitions are smaller than the source image.")
+
+    os_parts = [p for p in target_gpt.partitions if p.number != dst_state.number]
+    if any(p.end_lba >= dst_state.start_lba for p in os_parts):
+        raise ValueError("Target OS partitions overlap or follow STATE; refusing to update in place.")
+
+    updated: list[GptPartition] = []
+    for part in target_gpt.partitions:
+        upper = part.name.upper()
+        if upper == "STATE":
+            updated.append(part)
+        elif upper == "KERN-A":
+            updated.append(
+                GptPartition(
+                    number=part.number,
+                    name=part.name,
+                    type_guid=part.type_guid,
+                    unique_guid=src_kern_a.unique_guid,
+                    start_lba=part.start_lba,
+                    end_lba=part.end_lba,
+                    flags=KERN_A_INSTALL_FLAGS,
+                )
             )
-    except (OSError, PermissionError):
-        return None
-
-
-def patch_grub_in_block_device(
-    path_or_device: Path | str | int,
-    options: ChromeOSBootOptions,
-) -> bool:
-    close_when_done = False
-    if isinstance(path_or_device, int):
-        fd = path_or_device
-    else:
-        try:
-            fd = os.open(str(path_or_device), os.O_RDWR)
-            close_when_done = True
-        except (OSError, PermissionError):
-            return False
-
-    try:
-        header_buf = os.pread(fd, SECTOR_SIZE, SECTOR_SIZE)
-        if len(header_buf) < SECTOR_SIZE or header_buf[:8] != b"EFI PART":
-            return False
-
-        efi_lba = 299008
-        part_entries_lba = struct.unpack_from("<Q", header_buf, 72)[0]
-        num_entries = struct.unpack_from("<I", header_buf, 80)[0]
-        entry_size = struct.unpack_from("<I", header_buf, 84)[0]
-
-        entries_buf = os.pread(fd, num_entries * entry_size, part_entries_lba * SECTOR_SIZE)
-        for i in range(num_entries):
-            off = i * entry_size
-            name_raw = entries_buf[off + 56 : off + 56 + 72]
-            name = name_raw.decode("utf-16le", errors="ignore").split("\x00", 1)[0]
-            if name.upper() == "EFI-SYSTEM":
-                efi_lba = struct.unpack_from("<Q", entries_buf, off + 32)[0]
-                break
-
-        efi_base_bytes = efi_lba * SECTOR_SIZE
-        chunk = os.pread(fd, 2 * 1024 * 1024, efi_base_bytes)
-        idx = chunk.find(b"menuentry \"local image A\"")
-        if idx == -1:
-            idx = chunk.find(b"menuentry \"verified image A\"")
-        if idx == -1:
-            return False
-
-        start_idx = chunk.rfind(b"defaultA=", 0, idx)
-        if start_idx == -1:
-            start_idx = chunk.rfind(b"gptpriority", 0, idx)
-        if start_idx == -1:
-            start_idx = max(0, idx - 300)
-
-        alt_idx = chunk.find(b"Alternate USB Boot", idx)
-        end_idx = chunk.find(b"}", alt_idx if alt_idx != -1 else idx)
-        if end_idx == -1:
-            end_idx = min(len(chunk), idx + 2000)
+        elif upper == "KERN-B":
+            updated.append(
+                GptPartition(
+                    number=part.number,
+                    name=part.name,
+                    type_guid=part.type_guid,
+                    unique_guid=src_kern_b.unique_guid,
+                    start_lba=part.start_lba,
+                    end_lba=part.end_lba,
+                    flags=KERN_INACTIVE_FLAGS,
+                )
+            )
+        elif upper == "KERN-C":
+            updated.append(
+                GptPartition(
+                    number=part.number,
+                    name=part.name,
+                    type_guid=part.type_guid,
+                    unique_guid=part.unique_guid,
+                    start_lba=part.start_lba,
+                    end_lba=part.end_lba,
+                    flags=KERN_INACTIVE_FLAGS,
+                )
+            )
+        elif upper == "ROOT-A":
+            updated.append(
+                GptPartition(
+                    number=part.number,
+                    name=part.name,
+                    type_guid=part.type_guid,
+                    unique_guid=src_root_a.unique_guid,
+                    start_lba=part.start_lba,
+                    end_lba=part.end_lba,
+                    flags=0,
+                )
+            )
+        elif upper == "ROOT-B":
+            updated.append(
+                GptPartition(
+                    number=part.number,
+                    name=part.name,
+                    type_guid=part.type_guid,
+                    unique_guid=src_root_b.unique_guid if src_root_b is not None else part.unique_guid,
+                    start_lba=part.start_lba,
+                    end_lba=part.end_lba,
+                    flags=0,
+                )
+            )
+        elif upper == "EFI-SYSTEM":
+            updated.append(
+                GptPartition(
+                    number=part.number,
+                    name=part.name,
+                    type_guid=part.type_guid,
+                    unique_guid=src_efi.unique_guid,
+                    start_lba=part.start_lba,
+                    end_lba=part.end_lba,
+                    flags=EFI_LEGACY_BOOT_FLAG,
+                )
+            )
         else:
-            end_idx += 1
+            updated.append(part)
 
-        original_text = chunk[start_idx:end_idx].decode("utf-8", errors="ignore")
-        patched_text = patch_grub_cfg(original_text, options)
-        patched_bytes = patched_text.encode("utf-8")
-
-        fat_dir_idx = chunk.find(b"GRUB    CFG")
-        if fat_dir_idx != -1 and (fat_dir_idx + 32) <= len(chunk):
-            size_field_off = efi_base_bytes + fat_dir_idx + 28
-            os.pwrite(fd, struct.pack("<I", len(patched_bytes)), size_field_off)
-
-        write_off = efi_base_bytes + start_idx
-        orig_len = end_idx - start_idx
-        if len(patched_bytes) < orig_len:
-            patched_bytes = patched_bytes + (b" " * (orig_len - len(patched_bytes)))
-        os.pwrite(fd, patched_bytes, write_off)
-
-        # Force legacy boot toggle: disable or re-enable BOOTX64.EFI and BOOTIA32.EFI
-        bootx64_idx = chunk.find(b"BOOTX64 EFI")
-        bootx64_dis_idx = chunk.find(b"BOOTX64 DIS")
-        if options.force_legacy_boot:
-            if bootx64_idx != -1:
-                os.pwrite(fd, b"DIS", efi_base_bytes + bootx64_idx + 8)
-                lfn_ext = chunk.rfind(b"e\x00f\x00i\x00", max(0, bootx64_idx - 64), bootx64_idx)
-                if lfn_ext != -1:
-                    os.pwrite(fd, b"d\x00i\x00s\x00", efi_base_bytes + lfn_ext)
-            boot32_idx = chunk.find(b"BOOTIA32EFI")
-            if boot32_idx != -1:
-                os.pwrite(fd, b"DIS", efi_base_bytes + boot32_idx + 8)
-                lfn32 = chunk.rfind(b"e\x00f\x00i\x00", max(0, boot32_idx - 64), boot32_idx)
-                if lfn32 != -1:
-                    os.pwrite(fd, b"d\x00i\x00s\x00", efi_base_bytes + lfn32)
-        else:
-            if bootx64_dis_idx != -1:
-                os.pwrite(fd, b"EFI", efi_base_bytes + bootx64_dis_idx + 8)
-                lfn_dis = chunk.rfind(b"d\x00i\x00s\x00", max(0, bootx64_dis_idx - 64), bootx64_dis_idx)
-                if lfn_dis != -1:
-                    os.pwrite(fd, b"e\x00f\x00i\x00", efi_base_bytes + lfn_dis)
-            boot32_dis_idx = chunk.find(b"BOOTIA32DIS")
-            if boot32_dis_idx != -1:
-                os.pwrite(fd, b"EFI", efi_base_bytes + boot32_dis_idx + 8)
-                lfn32_dis = chunk.rfind(b"d\x00i\x00s\x00", max(0, boot32_dis_idx - 64), boot32_dis_idx)
-                if lfn32_dis != -1:
-                    os.pwrite(fd, b"e\x00f\x00i\x00", efi_base_bytes + lfn32_dis)
-
-        os.fsync(fd)
-        return True
-    except (OSError, PermissionError):
-        return False
-    finally:
-        if close_when_done:
-            os.close(fd)
-
+    return updated

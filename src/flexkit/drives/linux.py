@@ -6,6 +6,7 @@ import subprocess
 from typing import Any
 
 from flexkit.drives import Drive, Volume, format_drive_name
+from flexkit.writer.gpt import MIN_TOGO_ROOT_SECTORS, SECTOR_SIZE, is_chromeos_togo_drive
 
 log = logging.getLogger("flexkit.drives.linux")
 
@@ -51,6 +52,7 @@ def _mountpoints_of(node: dict[str, Any]) -> list[str]:
 def _collect_tree(
     node: dict[str, Any],
     volumes: list[Volume],
+    part_sizes: dict[str, int],
     *,
     is_root_node: bool = False,
 ) -> tuple[bool, bool]:
@@ -59,7 +61,15 @@ def _collect_tree(
     mps = _mountpoints_of(node)
     fstype = str(node.get("fstype") or "")
     label = str(node.get("label") or "")
+    partlabel = str(node.get("partlabel") or "").strip().upper()
     dev_path = str(node.get("path") or f"/dev/{node.get('name', '')}")
+
+    if partlabel and str(node.get("type") or "") == "part":
+        raw_sz = node.get("size")
+        try:
+            part_sizes[partlabel] = int(raw_sz) if raw_sz is not None else 0
+        except (TypeError, ValueError):
+            part_sizes[partlabel] = 0
 
     if fstype == "swap":
         is_system = True
@@ -81,7 +91,7 @@ def _collect_tree(
     if has_children:
         for child in children:
             if isinstance(child, dict):
-                child_sys, child_ro = _collect_tree(child, volumes, is_root_node=False)
+                child_sys, child_ro = _collect_tree(child, volumes, part_sizes, is_root_node=False)
                 is_system = is_system or child_sys
                 any_ro = any_ro or child_ro
 
@@ -101,6 +111,15 @@ def _classify_bus(tran: str, name: str) -> str:
     if t == "ieee1394":
         return "FireWire"
     return "Other"
+
+
+def _has_togo_partitions(part_sizes: dict[str, int]) -> bool:
+    required = {"STATE", "KERN-A", "KERN-B", "ROOT-A", "ROOT-B", "EFI-SYSTEM"}
+    if not required.issubset(part_sizes.keys()):
+        return False
+    root_a_sz = part_sizes["ROOT-A"]
+    root_b_sz = part_sizes["ROOT-B"]
+    return root_a_sz == root_b_sz and root_a_sz >= MIN_TOGO_ROOT_SECTORS * SECTOR_SIZE
 
 
 def parse_lsblk_json(payload: str | bytes) -> list[Drive]:
@@ -133,14 +152,13 @@ def parse_lsblk_json(payload: str | bytes) -> list[Drive]:
         removable = (rm or hotplug) if bus == "SD" else rm
 
         volumes: list[Volume] = []
-        is_system, _ = _collect_tree(dev, volumes, is_root_node=True)
+        part_sizes: dict[str, int] = {}
+        is_system, _ = _collect_tree(dev, volumes, part_sizes, is_root_node=True)
 
-        from flexkit.writer.gpt import is_chromeos_drive
-
-        vol_labels = {v.label.upper() for v in volumes}
-        has_cros = {"STATE", "KERN-A"}.issubset(vol_labels) or {"STATE", "ROOT-A"}.issubset(vol_labels)
-        if not has_cros:
-            has_cros = is_chromeos_drive(dev_path)
+        if part_sizes:
+            has_cros = _has_togo_partitions(part_sizes)
+        else:
+            has_cros = is_chromeos_togo_drive(dev_path)
 
         drives.append(
             Drive(
@@ -160,8 +178,14 @@ def parse_lsblk_json(payload: str | bytes) -> list[Drive]:
 
 
 def list_physical_drives() -> list[Drive]:
-    cols = "NAME,PATH,SIZE,VENDOR,MODEL,SERIAL,TRAN,RM,HOTPLUG,RO,TYPE,LABEL,FSTYPE,MOUNTPOINTS"
-    for col_spec in (cols, cols.replace("MOUNTPOINTS", "MOUNTPOINT")):
+    base_cols = "NAME,PATH,SIZE,VENDOR,MODEL,SERIAL,TRAN,RM,HOTPLUG,RO,TYPE,LABEL,PARTLABEL,FSTYPE,MOUNTPOINTS"
+    candidates = (
+        base_cols,
+        base_cols.replace("MOUNTPOINTS", "MOUNTPOINT"),
+        base_cols.replace(",PARTLABEL", ""),
+        base_cols.replace(",PARTLABEL", "").replace("MOUNTPOINTS", "MOUNTPOINT"),
+    )
+    for col_spec in candidates:
         try:
             out = subprocess.check_output(
                 ["lsblk", "-J", "-b", "-o", col_spec],

@@ -95,7 +95,7 @@ def _load_ctl(ctl_path: Path, release: Release, part_path: Path) -> dict[str, An
 def _write_ctl(ctl_path: Path, payload: dict[str, Any]) -> None:
     tmp = ctl_path.with_name(f"{ctl_path.name}.tmp")
     encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o644)
     try:
         os.write(fd, encoded)
         os.fsync(fd)

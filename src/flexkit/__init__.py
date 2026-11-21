@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import sys
 
-__version__ = "0.0.1"
+__version__ = "1.0.0"
 
 PROGRAM_NAME = "FlexKit"
 APP_NAME = "ChromeOS Flex Installer"
@@ -163,7 +163,7 @@ def configure_logging(
         except OSError:
             pass
 
-    if not helper_mode or _GLOBAL_LOG_LEVEL is not None:
+    if (not helper_mode or _GLOBAL_LOG_LEVEL is not None) and sys.stderr is not None:
         sh = logging.StreamHandler(sys.stderr)
         sh.setLevel(int_level)
         sh.setFormatter(fmt)

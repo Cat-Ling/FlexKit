@@ -555,15 +555,18 @@ class FlexKitWindow(QtWidgets.QMainWindow):
                 self._mid_btn.setText("Show in folder")
                 self._mid_btn.show()
             else:
+                done_title = (
+                    "Your ChromeOS To Go drive is ready"
+                    if self.drive_page.install_mode().startswith("to_go")
+                    else "Your USB installer is ready"
+                )
                 self._set_header(
                     "check",
-                    "Your USB installer is ready",
+                    done_title,
                     "You can now remove the drive.",
                     bg_hex=theme.SUCCESS_CONTAINER,
                     fg_hex=theme.SUCCESS,
                 )
-                opts = self.drive_page.boot_options()
-                self.done_page.set_legacy_warning(opts.force_legacy_boot, not opts.disable_auto_updates)
             self._stack.setCurrentWidget(self.done_page)
             self._primary_btn.setText("Done")
 
@@ -696,8 +699,16 @@ class FlexKitWindow(QtWidgets.QMainWindow):
             if drv is None or self._prepared is None:
                 return
             mode = self.drive_page.install_mode()
-            opts = self.drive_page.boot_options()
-            if confirm_write_dialog(self, self._prepared, drv, install_mode=mode, boot_options=opts):
+            install_flexshim = self.drive_page.install_flexshim_checked()
+            block_updates = self.drive_page.block_updates_checked()
+            if confirm_write_dialog(
+                self,
+                self._prepared,
+                drv,
+                install_mode=mode,
+                install_flexshim=install_flexshim,
+                block_updates=block_updates,
+            ):
                 self._target_drive = drv
                 self._start_write(drv)
             return
@@ -823,7 +834,6 @@ class FlexKitWindow(QtWidgets.QMainWindow):
     def _start_write(self, drive: Drive) -> None:
         assert self._prepared is not None
         mode = self.drive_page.install_mode()
-        opts = self.drive_page.boot_options()
         verify_drive = self.drive_page.verify_drive_checked()
 
         spec = WriteSpec(
@@ -836,13 +846,8 @@ class FlexKitWindow(QtWidgets.QMainWindow):
             expected_sha1=self._prepared.sha1,
             verify_drive=verify_drive,
             install_mode=mode,
-            cros_debug=opts.cros_debug,
-            disable_auto_updates=opts.disable_auto_updates,
-            verbose_boot=opts.verbose_boot,
-            timeout=opts.timeout,
-            nomodeset=opts.nomodeset,
-            unencrypted_stateful=opts.unencrypted_stateful,
-            force_legacy_boot=opts.force_legacy_boot,
+            install_flexshim=self.drive_page.install_flexshim_checked(),
+            block_updates=self.drive_page.block_updates_checked(),
         )
         self.progress_page.reset_indeterminate()
         self._go_to(Step.WRITING)

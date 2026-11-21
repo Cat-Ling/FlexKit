@@ -9,5 +9,6 @@ if (-not (Test-Path $VenvDir)) {
 
 & "$VenvDir\Scripts\python.exe" -m pip install --upgrade pip
 & "$VenvDir\Scripts\python.exe" -m pip install -r requirements-dev.txt
+& "$VenvDir\Scripts\python.exe" scripts/build.py --build-flexshim-only
 & "$VenvDir\Scripts\python.exe" -m pytest -q
-& "$VenvDir\Scripts\python.exe" scripts/build.py @args
+& "$VenvDir\Scripts\python.exe" scripts/build.py --skip-flexshim-build @args

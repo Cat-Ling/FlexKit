@@ -17,12 +17,12 @@ jobs:
         os:
           - ubuntu-22.04
           - windows-latest
-          - macos-14
-          - macos-13
+          - macos-15
+          - macos-15-intel
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
@@ -38,38 +38,110 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
 
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-uefi
+
+      - name: Build and test flexshim (UEFI)
+        shell: bash
+        run: |
+          cargo test --lib --manifest-path flexshim/Cargo.toml
+          python scripts/build.py --build-flexshim-only
+
       - name: Run test suite
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: python -m pytest -q
 
       - name: Compile native binary
-        run: python scripts/build.py
+        run: python scripts/build.py --skip-flexshim-build
 
-      - uses: actions/upload-artifact@v4
+      - name: Smoke test compiled binary
+        shell: bash
+        run: |
+          set -eu
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            dist/*.bin --version
+            test -f build/nuitka/*.dist/flexkit/assets/flexshim/flexshimx64.efi
+            test -f build/nuitka/*.dist/flexkit/assets/flexshim/flexshim.cfg
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            dist/*.exe --version
+            test -f build/nuitka/*.dist/flexkit/assets/flexshim/flexshimx64.efi
+            test -f build/nuitka/*.dist/flexkit/assets/flexshim/flexshim.cfg
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            build/nuitka/*.app/Contents/MacOS/flexkit.bin --version
+            test -f build/nuitka/*.app/Contents/MacOS/flexkit/assets/flexshim/flexshimx64.efi
+            test -f build/nuitka/*.app/Contents/MacOS/flexkit/assets/flexshim/flexshim.cfg
+          fi
+
+      - uses: actions/upload-artifact@v5
         with:
           name: dist-${{ matrix.os }}
           path: |
             dist/*
 
   freebsd-build:
-    name: Build (freebsd-14)
+    name: Build (freebsd)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-uefi
+
+      - name: Build and test flexshim (UEFI)
+        run: |
+          cargo test --lib --manifest-path flexshim/Cargo.toml
+          python3 scripts/build.py --build-flexshim-only
 
       - name: Test and build on FreeBSD
         uses: vmactions/freebsd-vm@v1
         with:
           usesh: true
           prepare: |
-            pkg install -y python311 py311-pip py311-pyside6 py311-pytest patchelf git
+            set -eu
+            pkg update
+            PY_PKG="$(pkg rquery '%n' | grep -E '^py3[0-9]+-pyside6$' | sort -V | tail -n 1 || true)"
+            QT_PLUGIN="pyside6"
+            if [ -z "$PY_PKG" ]; then
+              PY_PKG="$(pkg rquery '%n' | grep -E '^py3[0-9]+-qt6-pyqt$' | sort -V | tail -n 1 || true)"
+              QT_PLUGIN="pyqt6"
+            fi
+            if [ -z "$PY_PKG" ]; then
+              echo "No PySide6 or PyQt6 package found in pkg repository" >&2
+              exit 1
+            fi
+            PY_FLAVOR="${PY_PKG%%-*}"
+            PY_MINOR="${PY_FLAVOR#py3}"
+            PY_VER="3.${PY_MINOR}"
+            pkg install -y "python3${PY_MINOR}" "${PY_FLAVOR}-pip" "${PY_FLAVOR}-setuptools" "$PY_PKG" "${PY_FLAVOR}-pytest" "${PY_FLAVOR}-zstandard" patchelf ccache git
+            cat > /tmp/flexkit-freebsd-env.sh <<EOF
+            export PY_BIN="python${PY_VER}"
+            export QT_PLUGIN="${QT_PLUGIN}"
+            EOF
           run: |
-            python3.11 -m pip install nuitka
-            PYTHONPATH=src python3.11 -m pytest -q
-            python3.11 scripts/build.py
+            set -eu
+            . /tmp/flexkit-freebsd-env.sh
+            if "$PY_BIN" -m venv --system-site-packages /tmp/nuitka-venv 2>/dev/null; then
+              /tmp/nuitka-venv/bin/python -m pip install --upgrade "nuitka>=2.5"
+              PY_RUN=/tmp/nuitka-venv/bin/python
+            else
+              rm -rf /tmp/nuitka-venv
+              PIP_BREAK_SYSTEM_PACKAGES=1 "$PY_BIN" -m pip install "nuitka>=2.5"
+              PY_RUN="$PY_BIN"
+            fi
+            QT_QPA_PLATFORM=offscreen PYTHONPATH=src "$PY_RUN" -m pytest -q
+            "$PY_RUN" scripts/build.py --qt-plugin="$QT_PLUGIN" --skip-flexshim-build
+            build/nuitka/*.dist/flexkit.bin --version
+            test -f build/nuitka/*.dist/flexkit/assets/flexshim/flexshimx64.efi
+            test -f build/nuitka/*.dist/flexkit/assets/flexshim/flexshim.cfg
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
-          name: dist-freebsd-14
+          name: dist-freebsd
           path: |
             dist/*
 
@@ -81,7 +153,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: artifacts
           merge-multiple: true

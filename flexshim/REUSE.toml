@@ -1,0 +1,14 @@
+version = 1
+
+[[annotations]]
+path = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "COPYING",
+    "tests/fault_injector/Cargo.toml",
+    "tests/fault_injector/Cargo.lock",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 Cat-Ling <cat-ling@yemoja.xyz>"
+SPDX-License-Identifier = "GPL-3.0-or-later"

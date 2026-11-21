@@ -128,8 +128,9 @@ def write_block_device(
     logger.info("Opened %s exclusively as fd=%d", io_path, wfd)
 
     def flush_cache() -> None:
-        logger.info("Flushing block cache on fd=%d (size=%d)...", wfd, spec.image_size)
-        _flush_block_cache(wfd, spec.image_size)
+        flush_len = spec.expected_size or spec.image_size
+        logger.info("Flushing block cache on fd=%d (size=%d)...", wfd, flush_len)
+        _flush_block_cache(wfd, flush_len)
 
     try:
         stream_zip_to_fd(
@@ -145,13 +146,8 @@ def write_block_device(
             verify_drive=spec.verify_drive,
             install_mode=spec.install_mode,
             expected_size=spec.expected_size,
-            cros_debug=spec.cros_debug,
-            disable_auto_updates=spec.disable_auto_updates,
-            verbose_boot=spec.verbose_boot,
-            timeout=spec.timeout,
-            nomodeset=spec.nomodeset,
-            unencrypted_stateful=spec.unencrypted_stateful,
-            force_legacy_boot=spec.force_legacy_boot,
+            install_flexshim=spec.install_flexshim,
+            block_updates=spec.block_updates,
         )
     finally:
         logger.info("Closing block device fd=%d", wfd)

@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -121,11 +122,118 @@ def _supports_symlinks(directory: Path) -> bool:
         return False
 
 
+def _find_cargo() -> str:
+    cargo = shutil.which("cargo")
+    if cargo:
+        return cargo
+    exe_name = "cargo.exe" if sys.platform == "win32" else "cargo"
+    home_cargo = Path.home() / ".cargo" / "bin" / exe_name
+    if home_cargo.is_file():
+        return str(home_cargo)
+    raise RuntimeError("Rust cargo toolchain not found on PATH or ~/.cargo/bin")
+
+
+def build_flexshim(assets_flexshim_dir: Path, *, skip_build: bool = False) -> tuple[Path, Path]:
+    flexshim_root = ROOT / "flexshim"
+    efi_src = flexshim_root / "target" / "x86_64-unknown-uefi" / "release" / "flexshimx64.efi"
+    cfg_src = flexshim_root / "flexshim.cfg"
+    efi_dst = assets_flexshim_dir / "flexshimx64.efi"
+    cfg_dst = assets_flexshim_dir / "flexshim.cfg"
+
+    if skip_build:
+        if not efi_dst.is_file() or efi_dst.read_bytes()[:2] != b"MZ":
+            raise RuntimeError(f"Staged flexshimx64.efi missing or invalid at {efi_dst}")
+        if not cfg_dst.is_file():
+            raise RuntimeError(f"Staged flexshim.cfg missing at {cfg_dst}")
+        return efi_dst, cfg_dst
+
+    cargo_exe = _find_cargo()
+    subprocess.run(
+        [cargo_exe, "build", "--release", "--target", "x86_64-unknown-uefi", "--bin", "flexshimx64"],
+        cwd=flexshim_root,
+        check=True,
+    )
+    if not efi_src.is_file() or efi_src.read_bytes()[:2] != b"MZ":
+        raise RuntimeError(f"Compiled flexshimx64.efi missing or invalid at {efi_src}")
+    if not cfg_src.is_file():
+        raise RuntimeError(f"flexshim.cfg missing at {cfg_src}")
+
+    assets_flexshim_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(efi_src, efi_dst)
+    shutil.copy2(cfg_src, cfg_dst)
+    return efi_dst, cfg_dst
+
+
+def build_nuitka_command(
+    *,
+    python_exe: str,
+    target_platform: str,
+    qt_plugin: str,
+    work_dir: Path,
+    icons: dict[str, Path],
+    stem: str,
+) -> list[str]:
+    unused_qt = "PyQt6" if qt_plugin == "pyside6" else "PySide6"
+    cmd = [
+        python_exe,
+        "-m",
+        "nuitka",
+        f"--enable-plugin={qt_plugin}",
+        f"--nofollow-import-to={unused_qt}",
+        f"--include-data-dir={ROOT / 'src' / 'flexkit' / 'assets'}=flexkit/assets",
+        f"--output-dir={work_dir}",
+        f"--product-name={APP_NAME}",
+        f"--product-version={__version__}",
+        f"--file-version={__version__}",
+        "--company-name=FlexKit",
+        "--assume-yes-for-downloads",
+    ]
+
+    if target_platform == "win32":
+        cmd += [
+            "--onefile",
+            "--windows-console-mode=disable",
+            f"--windows-icon-from-ico={icons['ico']}",
+            f"--output-filename={stem}.exe",
+        ]
+    elif target_platform == "darwin":
+        cmd += [
+            "--standalone",
+            "--macos-create-app-bundle",
+            f"--macos-app-name={APP_NAME}",
+            f"--macos-app-icon={icons['icns']}",
+            f"--macos-app-version={__version__}",
+            f"--output-filename={APP_SLUG}.bin",
+        ]
+    elif "bsd" in target_platform:
+        cmd += [
+            "--standalone",
+            f"--output-filename={APP_SLUG}.bin",
+        ]
+    else:
+        cmd += [
+            "--onefile",
+            f"--output-filename={stem}.bin",
+        ]
+
+    cmd.append(str(ROOT / "src" / "flexkit" / "__main__.py"))
+    return cmd
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Compile FlexKit native binary with Nuitka")
     parser.add_argument("--sign", action="store_true", help="Sign binary if platform credentials are configured")
     parser.add_argument("--qt-plugin", choices=("pyside6", "pyqt6"), default="pyside6")
+    parser.add_argument("--build-flexshim-only", action="store_true", help="Build and stage flexshim UEFI assets only")
+    parser.add_argument("--skip-flexshim-build", action="store_true", help="Reuse pre-staged flexshim assets")
     args = parser.parse_args(argv)
+
+    assets_flexshim_dir = ROOT / "src" / "flexkit" / "assets" / "flexshim"
+    efi_dst, cfg_dst = build_flexshim(assets_flexshim_dir, skip_build=args.skip_flexshim_build)
+    if args.build_flexshim_only:
+        print(f"Staged {efi_dst}")
+        print(f"Staged {cfg_dst}")
+        return 0
 
     dist_dir = ROOT / "dist"
     dist_dir.mkdir(parents=True, exist_ok=True)
@@ -147,52 +255,14 @@ def main(argv: list[str] | None = None) -> int:
     env["PYTHONPATH"] = f"{src_path}{os.pathsep}{env['PYTHONPATH']}" if env.get("PYTHONPATH") else src_path
 
     python_exe = str(Path(sys.executable).parent.resolve() / Path(sys.executable).name)
-    unused_qt = "PyQt6" if args.qt_plugin == "pyside6" else "PySide6"
-    cmd = [
-        python_exe,
-        "-m",
-        "nuitka",
-        f"--enable-plugin={args.qt_plugin}",
-        f"--nofollow-import-to={unused_qt}",
-        f"--include-data-dir={ROOT / 'src' / 'flexkit' / 'assets'}=flexkit/assets",
-        f"--output-dir={work_dir}",
-        f"--product-name={APP_NAME}",
-        f"--product-version={__version__}",
-        f"--file-version={__version__}",
-        "--company-name=FlexKit",
-        "--assume-yes-for-downloads",
-    ]
-
-    if sys.platform == "win32":
-        out_name = f"{stem}.exe"
-        cmd += [
-            "--onefile",
-            "--windows-console-mode=disable",
-            f"--windows-icon-from-ico={icons['ico']}",
-            f"--output-filename={out_name}",
-        ]
-    elif sys.platform == "darwin":
-        cmd += [
-            "--standalone",
-            "--macos-create-app-bundle",
-            f"--macos-app-name={APP_NAME}",
-            f"--macos-app-icon={icons['icns']}",
-            f"--macos-app-version={__version__}",
-        ]
-    elif "bsd" in sys.platform:
-        cmd += [
-            "--standalone",
-            f"--output-filename={APP_SLUG}",
-        ]
-    else:
-        out_name = f"{stem}.bin"
-        cmd += [
-            "--onefile",
-            f"--linux-icon={icons['png']}",
-            f"--output-filename={out_name}",
-        ]
-
-    cmd.append(str(ROOT / "src" / "flexkit" / "__main__.py"))
+    cmd = build_nuitka_command(
+        python_exe=python_exe,
+        target_platform=sys.platform,
+        qt_plugin=args.qt_plugin,
+        work_dir=work_dir,
+        icons=icons,
+        stem=stem,
+    )
     subprocess.run(cmd, cwd=ROOT, env=env, check=True)
 
     if sys.platform == "win32":
@@ -234,23 +304,34 @@ def main(argv: list[str] | None = None) -> int:
                 ],
                 check=True,
             )
+        dmg_stage = stage_root / "dmg_stage"
+        shutil.rmtree(dmg_stage, ignore_errors=True)
+        dmg_stage.mkdir(parents=True, exist_ok=True)
+        staged_app = dmg_stage / f"{APP_NAME}.app"
+        shutil.copytree(app_bundle, staged_app, symlinks=True)
+        (dmg_stage / "Applications").symlink_to("/Applications")
+
         artifact = dist_dir / f"{stem}.dmg"
         artifact.unlink(missing_ok=True)
-        subprocess.run(
-            [
-                "hdiutil",
-                "create",
-                "-volname",
-                APP_NAME,
-                "-srcfolder",
-                str(app_bundle),
-                "-ov",
-                "-format",
-                "UDZO",
-                str(artifact),
-            ],
-            check=True,
-        )
+        hdiutil_cmd = [
+            "hdiutil",
+            "create",
+            "-volname",
+            APP_NAME,
+            "-srcfolder",
+            str(dmg_stage),
+            "-ov",
+            "-format",
+            "UDZO",
+            str(artifact),
+        ]
+        for attempt in range(3):
+            res = subprocess.run(hdiutil_cmd, check=False)
+            if res.returncode == 0:
+                break
+            if attempt == 2:
+                raise subprocess.CalledProcessError(res.returncode, hdiutil_cmd)
+            time.sleep(2)
     elif "bsd" in sys.platform:
         dist_folders = list(work_dir.glob("*.dist"))
         if not dist_folders:

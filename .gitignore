@@ -33,3 +33,9 @@ dist/
 Thumbs.db
 *~
 *.swp
+
+# flexshim build & staged assets
+flexshim/target/
+flexshim/build/
+flexshim/tests/fault_injector/target/
+src/flexkit/assets/flexshim/

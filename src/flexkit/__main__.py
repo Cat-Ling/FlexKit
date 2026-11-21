@@ -61,7 +61,8 @@ def main(argv: list[str] | None = None) -> int:
     args, qt_extra = parser.parse_known_args(raw_args)
 
     if args.version:
-        print(f"{PROGRAM_NAME} {__version__}")
+        if sys.stdout is not None:
+            print(f"{PROGRAM_NAME} {__version__}")
         return 0
 
     main_log = configure_logging(

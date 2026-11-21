@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.0] - 2026-11-21
+
+- Genuine ChromeOS Flex To Go mode matching `write_base_table` (4 GiB `ROOT-B`/`ROOT-A`, expanded pure-Python `H-STATE` ext4 partition, preserved partition GUIDs, unmodified signed OS partitions, and in-place To Go OS updates preserving user data).
+- Removed all ChromeOS binary/bootloader patching to preserve Verified Boot integrity.
+- Bundled `flexshim` UEFI compatibility shim (`flexshimx64.efi` + `flexshim.cfg`) with Advanced Boot Options for fixing UEFI boot panics on older PCs and disabling automatic updates via config.
+- Switched FlexKit license to GPL-3.0-or-later.
+- Fixed Windows, macOS (`arm64` & `x86_64`), and FreeBSD builds, tests, and GitHub Actions release pipeline.
+
 ## [0.0.1] - 2026-11-08
 
 - Initial release of FlexKit (`v0.0.1`).

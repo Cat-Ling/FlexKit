@@ -11,6 +11,8 @@ import pytest
 from flexkit.privilege import _HelperBridge
 from flexkit.writer import WriteError, stream_zip_to_fd
 
+_O_BIN = getattr(os, "O_BINARY", 0)
+
 
 def test_stream_zip_to_fd_and_readback_verify(tmp_path: Path) -> None:
     member = "chromeos_16836.30.0_reven_recovery_stable-channel_RevenMPKeys-v11.bin"
@@ -22,7 +24,7 @@ def test_stream_zip_to_fd_and_readback_verify(tmp_path: Path) -> None:
         zf.writestr(member, raw_img)
 
     target = tmp_path / "usb_block.img"
-    wfd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    wfd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_BIN, 0o600)
     phases: list[str] = []
 
     try:
@@ -32,7 +34,7 @@ def test_stream_zip_to_fd_and_readback_verify(tmp_path: Path) -> None:
             image_size=len(raw_img),
             expected_sha1=expected_sha1,
             write_fd=wfd,
-            open_read_fd=lambda: os.open(target, os.O_RDONLY),
+            open_read_fd=lambda: os.open(target, os.O_RDONLY | _O_BIN),
             progress_cb=lambda phase, _d, _t, _b: phases.append(phase),
         )
     finally:
@@ -51,10 +53,10 @@ def test_readback_verify_catches_disk_bitflip(tmp_path: Path) -> None:
         zf.writestr(member, raw_img)
 
     target = tmp_path / "bad_usb.img"
-    wfd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    wfd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_BIN, 0o600)
 
     def flip_byte_on_target() -> None:
-        fd = os.open(target, os.O_RDWR)
+        fd = os.open(target, os.O_RDWR | _O_BIN)
         try:
             os.lseek(fd, 4096, os.SEEK_SET)
             orig = os.read(fd, 1)
@@ -71,11 +73,39 @@ def test_readback_verify_catches_disk_bitflip(tmp_path: Path) -> None:
                 image_size=len(raw_img),
                 expected_sha1="",
                 write_fd=wfd,
-                open_read_fd=lambda: os.open(target, os.O_RDONLY),
+                open_read_fd=lambda: os.open(target, os.O_RDONLY | _O_BIN),
                 before_verify_hook=flip_byte_on_target,
             )
     finally:
         os.close(wfd)
+
+
+def test_posix_block_io_lseek_fallback_without_pread_pwrite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delattr(os, "pread", raising=False)
+    monkeypatch.delattr(os, "pwrite", raising=False)
+
+    member = "chromeos_fallback.bin"
+    raw_img = os.urandom(512 * 1024)
+    expected_sha1 = hashlib.sha1(raw_img).hexdigest()
+
+    archive = tmp_path / "fallback.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(member, raw_img)
+
+    target = tmp_path / "fallback_disk.img"
+    wfd = os.open(target, os.O_RDWR | os.O_CREAT | os.O_TRUNC | _O_BIN, 0o600)
+    try:
+        stream_zip_to_fd(
+            archive_path=archive,
+            member_name=member,
+            image_size=len(raw_img),
+            expected_sha1=expected_sha1,
+            write_fd=wfd,
+        )
+    finally:
+        os.close(wfd)
+
+    assert target.read_bytes() == raw_img
 
 
 def test_helper_bridge_rejects_unauthenticated_socket() -> None:
@@ -111,7 +141,7 @@ def test_stream_raw_bin_to_fd_and_readback_verify(tmp_path: Path) -> None:
     raw_file.write_bytes(raw_img)
 
     target = tmp_path / "usb_raw.img"
-    wfd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    wfd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_BIN, 0o600)
     try:
         stream_zip_to_fd(
             archive_path=raw_file,
@@ -119,7 +149,7 @@ def test_stream_raw_bin_to_fd_and_readback_verify(tmp_path: Path) -> None:
             image_size=len(raw_img),
             expected_sha1=expected_sha1,
             write_fd=wfd,
-            open_read_fd=lambda: os.open(target, os.O_RDONLY),
+            open_read_fd=lambda: os.open(target, os.O_RDONLY | _O_BIN),
         )
     finally:
         os.close(wfd)

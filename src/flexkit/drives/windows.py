@@ -5,6 +5,7 @@ from ctypes import wintypes
 import logging
 import os
 import sys
+from typing import Any
 
 from flexkit.drives import Drive, Volume, format_drive_name
 
@@ -80,6 +81,68 @@ def _cstr_at(buf: bytes, offset: int) -> str:
     end = buf.find(b"\x00", offset)
     raw = buf[offset:] if end == -1 else buf[offset:end]
     return raw.decode("ascii", errors="ignore").strip()
+
+
+def _make_kernel32() -> ctypes.WinDLL:
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    lpvoid = ctypes.c_void_p
+    lpdword = ctypes.POINTER(wintypes.DWORD)
+
+    k32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        lpvoid,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    k32.CreateFileW.restype = wintypes.HANDLE
+
+    k32.DeviceIoControl.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        lpvoid,
+        wintypes.DWORD,
+        lpvoid,
+        wintypes.DWORD,
+        lpdword,
+        lpvoid,
+    ]
+    k32.DeviceIoControl.restype = wintypes.BOOL
+
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
+
+    k32.FindFirstVolumeW.argtypes = [wintypes.LPWSTR, wintypes.DWORD]
+    k32.FindFirstVolumeW.restype = wintypes.HANDLE
+
+    k32.FindNextVolumeW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD]
+    k32.FindNextVolumeW.restype = wintypes.BOOL
+
+    k32.FindVolumeClose.argtypes = [wintypes.HANDLE]
+    k32.FindVolumeClose.restype = wintypes.BOOL
+
+    k32.GetVolumePathNamesForVolumeNameW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        lpdword,
+    ]
+    k32.GetVolumePathNamesForVolumeNameW.restype = wintypes.BOOL
+
+    k32.GetVolumeInformationW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        lpdword,
+        lpdword,
+        lpdword,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    k32.GetVolumeInformationW.restype = wintypes.BOOL
+    return k32
 
 
 def _collect_volume_map(kernel32: Any) -> tuple[dict[int, list[Volume]], set[int]]:
@@ -175,7 +238,7 @@ def list_physical_drives() -> list[Drive]:
     if sys.platform != "win32":
         return []
 
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = _make_kernel32()
     vol_map, sys_disks = _collect_volume_map(kernel32)
     drives: list[Drive] = []
 
@@ -243,7 +306,7 @@ def list_physical_drives() -> list[Drive]:
                 ctypes.byref(returned),
                 None,
             ):
-                if kernel32.GetLastError() == ERROR_WRITE_PROTECT:
+                if ctypes.get_last_error() == ERROR_WRITE_PROTECT:
                     read_only = True
 
             drives.append(

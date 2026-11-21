@@ -6,7 +6,6 @@ from flexkit.drives import Drive
 from flexkit.ui import theme
 from flexkit.ui.qt import QRectF, QTimer, Qt, QtCore, QtGui, QtWidgets
 from flexkit.ui.widgets import BadgeIcon, Banner, DestructiveButton, FilledButton, TextButton
-from flexkit.writer.gpt import ChromeOSBootOptions
 
 
 class _CardFrame(QtWidgets.QFrame):
@@ -103,7 +102,9 @@ def confirm_write_dialog(
     image: PreparedImage | Release,
     drive: Drive,
     install_mode: str = "installer",
-    boot_options: ChromeOSBootOptions | None = None,
+    *,
+    install_flexshim: bool = False,
+    block_updates: bool = False,
 ) -> bool:
     sheet = ScrimSheet(host)
     lay = sheet.card_layout
@@ -144,7 +145,7 @@ def confirm_write_dialog(
     add_row(0, "Target", drive_desc)
 
     if is_update:
-        mode_desc = "ChromeOS To Go (Preserve user data)"
+        mode_desc = "ChromeOS To Go (Keep user data, update OS)"
     elif install_mode == "to_go_fresh":
         mode_desc = "ChromeOS To Go (Full drive install)"
     else:
@@ -157,6 +158,14 @@ def confirm_write_dialog(
         img_desc = f"ChromeOS Flex {image.version} ({image.channel.label})"
     add_row(2, "Image", img_desc)
 
+    if install_flexshim or block_updates:
+        shim_desc = (
+            "flexshim (UEFI panic fix) · Automatic updates disabled"
+            if block_updates
+            else "flexshim (UEFI panic fix)"
+        )
+        add_row(3, "Boot shim", shim_desc)
+
     info_grid.setColumnStretch(1, 1)
     lay.addWidget(info_box)
 
@@ -165,15 +174,10 @@ def confirm_write_dialog(
         hdd_warn.show_message("This is a USB hard drive, not a flash drive.")
         lay.addWidget(hdd_warn)
 
-    if boot_options and boot_options.force_legacy_boot:
-        legacy_warn = Banner("warning", sheet.card)
-        if not boot_options.disable_auto_updates:
-            legacy_warn.show_message(
-                "Force Legacy Boot is enabled with auto-updates on. Older BIOS PCs may experience regressions after future ChromeOS updates."
-            )
-        else:
-            legacy_warn.show_message("Force Legacy Boot is enabled. Drive will boot via Legacy BIOS / CSM.")
-        lay.addWidget(legacy_warn)
+    if install_flexshim or block_updates:
+        shim_warn = Banner("warning", sheet.card)
+        shim_warn.show_message("flexshim is unsigned — disable UEFI Secure Boot on the target PC before booting.")
+        lay.addWidget(shim_warn)
 
     if is_update:
         warn_txt = QtWidgets.QLabel(

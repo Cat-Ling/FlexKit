@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
@@ -13,21 +13,19 @@ import socket
 import sys
 import threading
 import time
-from typing import IO
+from typing import IO, Protocol
 import zipfile
 
 from flexkit.drives import _drive_hosts_path, enumerate_all_drives
+from flexkit.writer.ext4 import format_ext4_partition
 from flexkit.writer.gpt import (
-    CHROMEOS_STATE_TYPE,
-    ChromeOSBootOptions,
     SECTOR_SIZE,
+    GptPartition,
+    GptTable,
     build_protective_mbr,
-    generate_chromeos_togo_partitions,
-    is_chromeos_drive,
-    patch_grub_cfg,
-    patch_grub_in_block_device,
-    read_chromeos_boot_options,
-    read_gpt_table,
+    plan_chromeos_togo_layout,
+    plan_chromeos_togo_update,
+    read_gpt_table_from_bytes,
     serialize_gpt,
 )
 
@@ -35,7 +33,7 @@ logger = logging.getLogger("flexkit.writer")
 
 WRITE_BLOCK_SIZE = 4 * 1024 * 1024
 FSYNC_INTERVAL = 32 * 1024 * 1024
-CHROMEOS_OS_PAYLOAD_SIZE = 6004736 * 512
+MIN_TOGO_DRIVE_SIZE = 11 * 1024 * 1024 * 1024
 
 WriteProgressCallback = Callable[[str, int, int, int], None]
 
@@ -46,6 +44,99 @@ class WriteError(RuntimeError):
 
 class WriteCancelled(Exception):
     pass
+
+
+class BlockDeviceIO(Protocol):
+    @property
+    def size(self) -> int: ...
+
+    def write_at(self, offset: int, data: bytes | memoryview) -> None: ...
+
+    def read_at(self, offset: int, size: int) -> bytes: ...
+
+    def flush(self) -> None: ...
+
+
+class PosixBlockIO:
+    def __init__(
+        self,
+        write_fd: int,
+        size: int,
+        open_read_fd: Callable[[], int] | None = None,
+    ) -> None:
+        self._write_fd = write_fd
+        self._size = size
+        self._open_read_fd = open_read_fd
+        self._read_fd: int | None = None
+        self._owns_read_fd = False
+        self._io_lock = threading.Lock()
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def _get_read_fd(self) -> int:
+        if self._read_fd is not None:
+            return self._read_fd
+        if self._open_read_fd is not None:
+            self._read_fd = self._open_read_fd()
+            self._owns_read_fd = True
+            return self._read_fd
+        return self._write_fd
+
+    def reopen_for_read(self) -> None:
+        self.close_read_fd()
+        if self._open_read_fd is not None:
+            self._read_fd = self._open_read_fd()
+            self._owns_read_fd = True
+
+    def close_read_fd(self) -> None:
+        if self._owns_read_fd and self._read_fd is not None:
+            try:
+                os.close(self._read_fd)
+            except OSError:
+                pass
+            self._read_fd = None
+            self._owns_read_fd = False
+
+    def write_at(self, offset: int, data: bytes | memoryview) -> None:
+        view = memoryview(data)
+        pos = 0
+        total = len(view)
+        pwrite = getattr(os, "pwrite", None)
+        while pos < total:
+            if pwrite is not None:
+                n = pwrite(self._write_fd, view[pos:], offset + pos)
+            else:
+                with self._io_lock:
+                    os.lseek(self._write_fd, offset + pos, os.SEEK_SET)
+                    n = os.write(self._write_fd, view[pos:])
+            if n <= 0:
+                raise WriteError("Short write to target device.")
+            pos += n
+
+    def read_at(self, offset: int, size: int) -> bytes:
+        fd = self._get_read_fd()
+        out = bytearray(size)
+        view = memoryview(out)
+        pos = 0
+        pread = getattr(os, "pread", None)
+        while pos < size:
+            if pread is not None:
+                chunk = pread(fd, size - pos, offset + pos)
+            else:
+                with self._io_lock:
+                    os.lseek(fd, offset + pos, os.SEEK_SET)
+                    chunk = os.read(fd, size - pos)
+            if not chunk:
+                raise WriteError("Unexpected EOF during read-back verification.")
+            n = len(chunk)
+            view[pos : pos + n] = chunk
+            pos += n
+        return bytes(out)
+
+    def flush(self) -> None:
+        os.fsync(self._write_fd)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,13 +150,8 @@ class WriteSpec:
     expected_sha1: str = ""
     verify_drive: bool = True
     install_mode: str = "installer"
-    cros_debug: bool = False
-    disable_auto_updates: bool = False
-    verbose_boot: bool = False
-    timeout: int = 2
-    nomodeset: bool = False
-    unencrypted_stateful: bool = False
-    force_legacy_boot: bool = False
+    install_flexshim: bool = False
+    block_updates: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -78,13 +164,8 @@ class WriteSpec:
             "expected_sha1": self.expected_sha1,
             "verify_drive": self.verify_drive,
             "install_mode": self.install_mode,
-            "cros_debug": self.cros_debug,
-            "disable_auto_updates": self.disable_auto_updates,
-            "verbose_boot": self.verbose_boot,
-            "timeout": self.timeout,
-            "nomodeset": self.nomodeset,
-            "unencrypted_stateful": self.unencrypted_stateful,
-            "force_legacy_boot": self.force_legacy_boot,
+            "install_flexshim": self.install_flexshim,
+            "block_updates": self.block_updates,
         }
 
     @classmethod
@@ -99,14 +180,17 @@ class WriteSpec:
             expected_sha1=str(d.get("expected_sha1") or "").lower(),
             verify_drive=bool(d.get("verify_drive", True)),
             install_mode=str(d.get("install_mode") or "installer"),
-            cros_debug=bool(d.get("cros_debug", False)),
-            disable_auto_updates=bool(d.get("disable_auto_updates", False)),
-            verbose_boot=bool(d.get("verbose_boot", False)),
-            timeout=int(d.get("timeout") or 2),
-            nomodeset=bool(d.get("nomodeset", False)),
-            unencrypted_stateful=bool(d.get("unencrypted_stateful", False)),
-            force_legacy_boot=bool(d.get("force_legacy_boot", False)),
+            install_flexshim=bool(d.get("install_flexshim", False)),
+            block_updates=bool(d.get("block_updates", False)),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _CopyOp:
+    name: str
+    src_offset: int
+    length: int
+    dst_offsets: tuple[int, ...]
 
 
 def verify_target_device(spec: WriteSpec) -> None:
@@ -123,8 +207,18 @@ def verify_target_device(spec: WriteSpec) -> None:
         raise WriteError(f"Refusing to write to non-USB bus ({drv.bus}).")
     if drv.size != spec.expected_size or drv.serial != spec.expected_serial:
         raise WriteError("Drive identity changed since confirmation; aborting for safety.")
-    if drv.size < spec.image_size:
-        raise WriteError("Target drive is smaller than the ChromeOS Flex image.")
+
+    if spec.install_mode == "to_go_fresh":
+        min_req = max(spec.image_size, MIN_TOGO_DRIVE_SIZE)
+        if drv.size < min_req:
+            raise WriteError("Target drive is too small for ChromeOS To Go (16 GB or larger required).")
+    elif spec.install_mode == "to_go_update":
+        if drv.size < spec.image_size:
+            raise WriteError("Target drive is smaller than the ChromeOS Flex image.")
+    else:
+        if drv.size < spec.image_size:
+            raise WriteError("Target drive is smaller than the ChromeOS Flex image.")
+
     if _drive_hosts_path(drv, spec.archive_path):
         raise WriteError("Refusing to overwrite the drive holding the downloaded archive.")
 
@@ -150,6 +244,575 @@ def open_image_source(archive_path: Path, member_name: str, image_size: int) -> 
             yield src
 
 
+def _read_exact(src: IO[bytes], count: int) -> bytes:
+    out = bytearray()
+    while len(out) < count:
+        chunk = src.read(count - len(out))
+        if not chunk:
+            break
+        out.extend(chunk)
+    return bytes(out)
+
+
+def _skip_bytes(src: IO[bytes], count: int, cancel_check: Callable[[], bool] | None) -> None:
+    rem = count
+    while rem > 0:
+        if cancel_check is not None and cancel_check():
+            raise WriteCancelled()
+        chunk = src.read(min(WRITE_BLOCK_SIZE, rem))
+        if not chunk:
+            raise WriteError("Unexpected end of source image while advancing stream.")
+        rem -= len(chunk)
+
+
+def _build_togo_copy_ops(source_gpt: GptTable, dst_parts: Sequence[GptPartition]) -> list[_CopyOp]:
+    dst_by_num = {p.number: p for p in dst_parts}
+    ops: list[_CopyOp] = []
+
+    for p_num in (11, 6, 7, 9, 10):
+        src_p = source_gpt.get_by_num(p_num)
+        dst_p = dst_by_num.get(p_num)
+        if src_p is not None and dst_p is not None and src_p.size_bytes > 0 and dst_p.size_bytes >= src_p.size_bytes:
+            ops.append(
+                _CopyOp(
+                    name=src_p.name or f"P{p_num}",
+                    src_offset=src_p.start_lba * SECTOR_SIZE,
+                    length=src_p.size_bytes,
+                    dst_offsets=(dst_p.start_lba * SECTOR_SIZE,),
+                )
+            )
+
+    src_kern = source_gpt.get_by_name("KERN-B") or source_gpt.get_by_name("KERN-A")
+    dst_kern_a = dst_by_num.get(2)
+    dst_kern_b = dst_by_num.get(4)
+    if src_kern is None or dst_kern_a is None or dst_kern_b is None:
+        raise WriteError("Missing KERN partitions for ChromeOS To Go.")
+    ops.append(
+        _CopyOp(
+            name="KERN-A/B",
+            src_offset=src_kern.start_lba * SECTOR_SIZE,
+            length=src_kern.size_bytes,
+            dst_offsets=(dst_kern_a.start_lba * SECTOR_SIZE, dst_kern_b.start_lba * SECTOR_SIZE),
+        )
+    )
+
+    src_oem = source_gpt.get_by_name("OEM")
+    dst_oem = dst_by_num.get(8)
+    if src_oem is None or dst_oem is None:
+        raise WriteError("Missing OEM partition for ChromeOS To Go.")
+    ops.append(
+        _CopyOp(
+            name="OEM",
+            src_offset=src_oem.start_lba * SECTOR_SIZE,
+            length=src_oem.size_bytes,
+            dst_offsets=(dst_oem.start_lba * SECTOR_SIZE,),
+        )
+    )
+
+    src_efi = source_gpt.get_by_name("EFI-SYSTEM")
+    dst_efi = dst_by_num.get(12)
+    if src_efi is None or dst_efi is None:
+        raise WriteError("Missing EFI-SYSTEM partition for ChromeOS To Go.")
+    ops.append(
+        _CopyOp(
+            name="EFI-SYSTEM",
+            src_offset=src_efi.start_lba * SECTOR_SIZE,
+            length=src_efi.size_bytes,
+            dst_offsets=(dst_efi.start_lba * SECTOR_SIZE,),
+        )
+    )
+
+    src_root_a = source_gpt.get_by_name("ROOT-A")
+    dst_root_b = dst_by_num.get(5)
+    dst_root_a = dst_by_num.get(3)
+    if src_root_a is None or dst_root_b is None or dst_root_a is None:
+        raise WriteError("Missing ROOT partitions for ChromeOS To Go.")
+    ops.append(
+        _CopyOp(
+            name="ROOT-A/B",
+            src_offset=src_root_a.start_lba * SECTOR_SIZE,
+            length=src_root_a.size_bytes,
+            dst_offsets=(dst_root_b.start_lba * SECTOR_SIZE, dst_root_a.start_lba * SECTOR_SIZE),
+        )
+    )
+
+    ops.sort(key=lambda op: op.src_offset)
+    for idx in range(len(ops) - 1):
+        cur = ops[idx]
+        nxt = ops[idx + 1]
+        if cur.src_offset + cur.length > nxt.src_offset:
+            raise WriteError(f"Overlapping source partitions ({cur.name} and {nxt.name}).")
+    return ops
+
+
+def _stream_installer_to_io(
+    *,
+    archive_path: Path,
+    member_name: str,
+    image_size: int,
+    expected_sha1: str,
+    io: BlockDeviceIO,
+    progress_cb: WriteProgressCallback | None,
+    cancel_check: Callable[[], bool] | None,
+    before_verify_hook: Callable[[], None] | None,
+    verify_drive: bool,
+    install_flexshim: bool = False,
+    block_updates: bool = False,
+) -> None:
+    write_sha1 = hashlib.sha1()
+    written = 0
+    since_sync = 0
+    win_start = time.monotonic()
+    win_bytes = 0
+    bps = 0
+    last_logged_mb = 0
+
+    if progress_cb is not None:
+        progress_cb("write", 0, image_size, 0)
+
+    with open_image_source(archive_path, member_name, image_size) as src:
+        while written < image_size:
+            if cancel_check is not None and cancel_check():
+                raise WriteCancelled()
+            chunk = src.read(min(WRITE_BLOCK_SIZE, image_size - written))
+            if not chunk:
+                break
+            io.write_at(written, chunk)
+            write_sha1.update(chunk)
+            written += len(chunk)
+            since_sync += len(chunk)
+            win_bytes += len(chunk)
+
+            if since_sync >= FSYNC_INTERVAL:
+                io.flush()
+                since_sync = 0
+
+            now = time.monotonic()
+            elapsed = now - win_start
+            if elapsed >= 0.4:
+                inst = int(win_bytes / elapsed)
+                bps = inst if bps == 0 else int(bps * 0.6 + inst * 0.4)
+                win_start = now
+                win_bytes = 0
+            if progress_cb is not None:
+                progress_cb("write", written, image_size, bps)
+
+            if written - last_logged_mb >= 500 * 1024 * 1024 or written == image_size:
+                logger.info(
+                    "Write progress: %d / %d bytes (%.1f%%) @ %d bps",
+                    written,
+                    image_size,
+                    (written / image_size) * 100 if image_size > 0 else 0,
+                    bps,
+                )
+                last_logged_mb = written
+
+    io.flush()
+
+    if written != image_size:
+        raise WriteError("Incomplete image stream written to target.")
+    computed_sha1 = write_sha1.hexdigest().lower()
+    if expected_sha1 and computed_sha1 != expected_sha1.lower():
+        raise WriteError("Decompressed image SHA-1 did not match expected digest.")
+
+    if verify_drive:
+        if before_verify_hook is not None:
+            logger.info("Calling before_verify_hook...")
+            before_verify_hook()
+
+        if isinstance(io, PosixBlockIO):
+            io.reopen_for_read()
+
+        logger.info("Beginning read-back verification of %d bytes", image_size)
+        verify_sha1 = hashlib.sha1()
+        checked = 0
+        win_start = time.monotonic()
+        win_bytes = 0
+        bps = 0
+        last_logged_v_mb = 0
+        if progress_cb is not None:
+            progress_cb("verify", 0, image_size, 0)
+
+        while checked < image_size:
+            if cancel_check is not None and cancel_check():
+                raise WriteCancelled()
+            to_read = min(WRITE_BLOCK_SIZE, image_size - checked)
+            buf = io.read_at(checked, to_read)
+            verify_sha1.update(buf)
+            checked += len(buf)
+            win_bytes += len(buf)
+
+            now = time.monotonic()
+            elapsed = now - win_start
+            if elapsed >= 0.4:
+                inst = int(win_bytes / elapsed)
+                bps = inst if bps == 0 else int(bps * 0.6 + inst * 0.4)
+                win_start = now
+                win_bytes = 0
+            if progress_cb is not None:
+                progress_cb("verify", checked, image_size, bps)
+
+            if checked - last_logged_v_mb >= 500 * 1024 * 1024 or checked == image_size:
+                logger.info(
+                    "Verify progress: %d / %d bytes (%.1f%%) @ %d bps",
+                    checked,
+                    image_size,
+                    (checked / image_size) * 100 if image_size > 0 else 0,
+                    bps,
+                )
+                last_logged_v_mb = checked
+
+        v_hex = verify_sha1.hexdigest().lower()
+        logger.info("Read-back verification completed. Checksum: %s", v_hex)
+        if v_hex != computed_sha1:
+            raise WriteError("Verification failed: data read back from drive did not match image SHA-1.")
+        logger.info("Drive verification successful!")
+    else:
+        logger.info("Verification skipped by user option.")
+
+    if install_flexshim or block_updates:
+        from flexkit.writer.flexshim import install_flexshim_to_esp, verify_flexshim_on_esp
+
+        hdr_buf = io.read_at(0, 34 * SECTOR_SIZE)
+        table = read_gpt_table_from_bytes(hdr_buf)
+        if table is None or not table.is_chromeos:
+            raise WriteError("Image does not contain a valid ChromeOS GPT table to install flexshim.")
+        efi_part = table.get_by_name("EFI-SYSTEM")
+        if efi_part is None:
+            raise WriteError("Missing EFI-SYSTEM partition for flexshim installation.")
+        esp_offset = efi_part.start_lba * SECTOR_SIZE
+        esp_size = efi_part.size_bytes
+        logger.info("Installing flexshim into EFI-SYSTEM at offset %d (block_updates=%s)...", esp_offset, block_updates)
+        efi_bytes, cfg_bytes = install_flexshim_to_esp(io, esp_offset, esp_size, block_updates=block_updates)
+        io.flush()
+        if verify_drive:
+            if before_verify_hook is not None:
+                before_verify_hook()
+            if isinstance(io, PosixBlockIO):
+                io.reopen_for_read()
+            verify_flexshim_on_esp(io, esp_offset, esp_size, efi_bytes, cfg_bytes)
+            logger.info("flexshim verification successful!")
+
+
+def _stream_togo_to_io(
+    *,
+    archive_path: Path,
+    member_name: str,
+    image_size: int,
+    io: BlockDeviceIO,
+    install_mode: str,
+    expected_size: int,
+    progress_cb: WriteProgressCallback | None,
+    cancel_check: Callable[[], bool] | None,
+    before_verify_hook: Callable[[], None] | None,
+    verify_drive: bool,
+    install_flexshim: bool = False,
+    block_updates: bool = False,
+) -> None:
+    disk_bytes = expected_size if expected_size > 0 else io.size
+    total_sectors = disk_bytes // SECTOR_SIZE
+    if total_sectors < 1000:
+        raise WriteError("Invalid target drive size for ChromeOS To Go.")
+
+    target_gpt_existing: GptTable | None = None
+    if install_mode == "to_go_update":
+        hdr_buf = io.read_at(0, 34 * SECTOR_SIZE)
+        target_gpt_existing = read_gpt_table_from_bytes(hdr_buf)
+        if target_gpt_existing is None or not target_gpt_existing.is_chromeos_togo:
+            raise WriteError("Target drive does not have a valid ChromeOS To Go installation to update.")
+
+    with open_image_source(archive_path, member_name, image_size) as src:
+        src_hdr = _read_exact(src, 34 * SECTOR_SIZE)
+        if len(src_hdr) < 34 * SECTOR_SIZE:
+            raise WriteError("Source image header is truncated.")
+        src_pos = len(src_hdr)
+
+        source_gpt = read_gpt_table_from_bytes(src_hdr)
+        if source_gpt is None or not source_gpt.is_chromeos:
+            raise WriteError("Source image does not contain a valid ChromeOS GPT table.")
+
+        boot_code = src_hdr[:446] if any(b != 0 for b in src_hdr[:446]) else None
+
+        try:
+            if install_mode == "to_go_fresh":
+                dst_parts = plan_chromeos_togo_layout(source_gpt, total_sectors)
+                disk_guid = None
+            else:
+                assert target_gpt_existing is not None
+                dst_parts = plan_chromeos_togo_update(source_gpt, target_gpt_existing)
+                disk_guid = target_gpt_existing.disk_guid
+        except ValueError as exc:
+            raise WriteError(str(exc)) from exc
+
+        dst_efi = next((p for p in dst_parts if p.number == 12), None)
+        dst_state = next((p for p in dst_parts if p.number == 1), None)
+        if dst_efi is None or dst_state is None:
+            raise WriteError("Planned ChromeOS To Go layout is missing EFI-SYSTEM or STATE.")
+
+        copy_ops = _build_togo_copy_ops(source_gpt, dst_parts)
+        total_write_bytes = sum(op.length * len(op.dst_offsets) for op in copy_ops)
+        if total_write_bytes <= 0:
+            raise WriteError("No partitions scheduled to write.")
+
+        mbr = build_protective_mbr(
+            total_sectors,
+            boot_code=boot_code,
+            efi_lba=dst_efi.start_lba,
+            efi_sectors=dst_efi.sector_count,
+        )
+        primary_hdr, entries, backup_hdr = serialize_gpt(total_sectors, dst_parts, disk_guid=disk_guid)
+
+        if install_mode == "to_go_fresh":
+            wipe_64 = b"\x00" * (64 * SECTOR_SIZE)
+            io.write_at(0, wipe_64)
+            io.write_at((total_sectors - 64) * SECTOR_SIZE, wipe_64)
+            io.write_at(0, mbr)
+            io.write_at(SECTOR_SIZE, primary_hdr)
+            io.write_at(2 * SECTOR_SIZE, entries)
+            io.write_at((total_sectors - 33) * SECTOR_SIZE, entries)
+            io.write_at((total_sectors - 1) * SECTOR_SIZE, backup_hdr)
+
+        if progress_cb is not None:
+            progress_cb("write", 0, total_write_bytes, 0)
+
+        written = 0
+        since_sync = 0
+        win_start = time.monotonic()
+        win_bytes = 0
+        bps = 0
+        last_logged_mb = 0
+        op_sha1s: list[str] = []
+
+        for op in copy_ops:
+            if op.src_offset > src_pos:
+                _skip_bytes(src, op.src_offset - src_pos, cancel_check)
+                src_pos = op.src_offset
+
+            op_hash = hashlib.sha1()
+            op_pos = 0
+            while op_pos < op.length:
+                if cancel_check is not None and cancel_check():
+                    raise WriteCancelled()
+                want = min(WRITE_BLOCK_SIZE, op.length - op_pos)
+                chunk = _read_exact(src, want)
+                if len(chunk) != want:
+                    raise WriteError(f"Unexpected end of source stream reading {op.name}.")
+                src_pos += want
+                op_hash.update(chunk)
+
+                for dst_base in op.dst_offsets:
+                    io.write_at(dst_base + op_pos, chunk)
+                    written += want
+                    since_sync += want
+                    win_bytes += want
+
+                op_pos += want
+                if since_sync >= FSYNC_INTERVAL:
+                    io.flush()
+                    since_sync = 0
+
+                now = time.monotonic()
+                elapsed = now - win_start
+                if elapsed >= 0.4:
+                    inst = int(win_bytes / elapsed)
+                    bps = inst if bps == 0 else int(bps * 0.6 + inst * 0.4)
+                    win_start = now
+                    win_bytes = 0
+                if progress_cb is not None:
+                    # Keep progress just shy of 100% until STATE formatting/GPT finalize completes.
+                    reported = min(written, max(0, total_write_bytes - 1))
+                    progress_cb("write", reported, total_write_bytes, bps)
+
+                if written - last_logged_mb >= 500 * 1024 * 1024:
+                    logger.info(
+                        "Write progress: %d / %d bytes (%.1f%%) @ %d bps",
+                        written,
+                        total_write_bytes,
+                        (written / total_write_bytes) * 100,
+                        bps,
+                    )
+                    last_logged_mb = written
+
+            op_sha1s.append(op_hash.hexdigest().lower())
+
+    if install_mode == "to_go_fresh":
+        logger.info(
+            "Formatting STATE (H-STATE ext4) at LBA %d (%d bytes)...",
+            dst_state.start_lba,
+            dst_state.size_bytes,
+        )
+        format_ext4_partition(
+            io.write_at,
+            dst_state.start_lba * SECTOR_SIZE,
+            dst_state.size_bytes,
+            label="H-STATE",
+        )
+    else:
+        # Commit updated GPT & MBR after OS partitions are written.
+        io.write_at(0, mbr)
+        io.write_at(SECTOR_SIZE, primary_hdr)
+        io.write_at(2 * SECTOR_SIZE, entries)
+        io.write_at((total_sectors - 33) * SECTOR_SIZE, entries)
+        io.write_at((total_sectors - 1) * SECTOR_SIZE, backup_hdr)
+
+    io.flush()
+    if progress_cb is not None:
+        progress_cb("write", total_write_bytes, total_write_bytes, bps)
+
+    if install_flexshim or block_updates:
+        from flexkit.writer.flexshim import install_flexshim_to_esp, verify_flexshim_on_esp
+
+        esp_offset = dst_efi.start_lba * SECTOR_SIZE
+        esp_size = dst_efi.size_bytes
+        logger.info("Installing flexshim into To Go EFI-SYSTEM at offset %d (block_updates=%s)...", esp_offset, block_updates)
+        efi_bytes, cfg_bytes = install_flexshim_to_esp(io, esp_offset, esp_size, block_updates=block_updates)
+        io.flush()
+    else:
+        efi_bytes = b""
+        cfg_bytes = b""
+
+    if not verify_drive:
+        logger.info("Verification skipped by user option.")
+        return
+
+    if before_verify_hook is not None:
+        logger.info("Calling before_verify_hook...")
+        before_verify_hook()
+
+    if isinstance(io, PosixBlockIO):
+        io.reopen_for_read()
+
+    if io.read_at(0, SECTOR_SIZE) != mbr:
+        raise WriteError("Verification failed: MBR read-back mismatch.")
+    if io.read_at(SECTOR_SIZE, SECTOR_SIZE) != primary_hdr:
+        raise WriteError("Verification failed: primary GPT header mismatch.")
+    if io.read_at(2 * SECTOR_SIZE, len(entries)) != entries:
+        raise WriteError("Verification failed: primary GPT entries mismatch.")
+    if io.read_at((total_sectors - 33) * SECTOR_SIZE, len(entries)) != entries:
+        raise WriteError("Verification failed: backup GPT entries mismatch.")
+    if io.read_at((total_sectors - 1) * SECTOR_SIZE, SECTOR_SIZE) != backup_hdr:
+        raise WriteError("Verification failed: backup GPT header mismatch.")
+
+    if install_mode == "to_go_fresh":
+        state_sb = io.read_at(dst_state.start_lba * SECTOR_SIZE + 1024, 1024)
+        if state_sb[0x38:0x3A] != b"\x53\xef":
+            raise WriteError("Verification failed: H-STATE ext4 superblock magic missing.")
+
+    total_verify_bytes = total_write_bytes
+    checked = 0
+    win_start = time.monotonic()
+    win_bytes = 0
+    bps = 0
+    last_logged_v_mb = 0
+    if progress_cb is not None:
+        progress_cb("verify", 0, total_verify_bytes, 0)
+
+    for op, expected_op_sha1 in zip(copy_ops, op_sha1s, strict=True):
+        verify_len = op.length
+        # flexshim updates /efi/boot files inside EFI-SYSTEM; verify unmodified region separately below if needed.
+        if (install_flexshim or block_updates) and op.name == "EFI-SYSTEM":
+            checked += op.length * len(op.dst_offsets)
+            continue
+        for dst_base in op.dst_offsets:
+            v_hash = hashlib.sha1()
+            pos = 0
+            while pos < verify_len:
+                if cancel_check is not None and cancel_check():
+                    raise WriteCancelled()
+                want = min(WRITE_BLOCK_SIZE, verify_len - pos)
+                buf = io.read_at(dst_base + pos, want)
+                v_hash.update(buf)
+                pos += want
+                checked += want
+                win_bytes += want
+
+                now = time.monotonic()
+                elapsed = now - win_start
+                if elapsed >= 0.4:
+                    inst = int(win_bytes / elapsed)
+                    bps = inst if bps == 0 else int(bps * 0.6 + inst * 0.4)
+                    win_start = now
+                    win_bytes = 0
+                if progress_cb is not None:
+                    progress_cb("verify", checked, total_verify_bytes, bps)
+
+                if checked - last_logged_v_mb >= 500 * 1024 * 1024 or checked == total_verify_bytes:
+                    logger.info(
+                        "Verify progress: %d / %d bytes (%.1f%%) @ %d bps",
+                        checked,
+                        total_verify_bytes,
+                        (checked / total_verify_bytes) * 100,
+                        bps,
+                    )
+                    last_logged_v_mb = checked
+
+            if v_hash.hexdigest().lower() != expected_op_sha1:
+                raise WriteError(f"Verification failed: data read back from {op.name} did not match source SHA-1.")
+
+    if install_flexshim or block_updates:
+        verify_flexshim_on_esp(io, dst_efi.start_lba * SECTOR_SIZE, dst_efi.size_bytes, efi_bytes, cfg_bytes)
+
+    logger.info("ChromeOS To Go drive verification successful!")
+
+
+def write_image_to_block_io(
+    *,
+    archive_path: Path,
+    member_name: str,
+    image_size: int,
+    expected_sha1: str,
+    io: BlockDeviceIO,
+    progress_cb: WriteProgressCallback | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    before_verify_hook: Callable[[], None] | None = None,
+    verify_drive: bool = True,
+    install_mode: str = "installer",
+    expected_size: int = 0,
+    install_flexshim: bool = False,
+    block_updates: bool = False,
+) -> None:
+    logger.info(
+        "Starting write_image_to_block_io: image_size=%d, expected_size=%d, mode=%s, verify=%s, flexshim=%s, block_updates=%s, sha1=%s",
+        image_size,
+        expected_size,
+        install_mode,
+        verify_drive,
+        install_flexshim,
+        block_updates,
+        expected_sha1,
+    )
+    if install_mode in ("to_go_fresh", "to_go_update"):
+        _stream_togo_to_io(
+            archive_path=archive_path,
+            member_name=member_name,
+            image_size=image_size,
+            io=io,
+            install_mode=install_mode,
+            expected_size=expected_size,
+            progress_cb=progress_cb,
+            cancel_check=cancel_check,
+            before_verify_hook=before_verify_hook,
+            verify_drive=verify_drive,
+            install_flexshim=install_flexshim,
+            block_updates=block_updates,
+        )
+        return
+
+    _stream_installer_to_io(
+        archive_path=archive_path,
+        member_name=member_name,
+        image_size=image_size,
+        expected_sha1=expected_sha1,
+        io=io,
+        progress_cb=progress_cb,
+        cancel_check=cancel_check,
+        before_verify_hook=before_verify_hook,
+        verify_drive=verify_drive,
+        install_flexshim=install_flexshim,
+        block_updates=block_updates,
+    )
+
+
 def stream_zip_to_fd(
     *,
     archive_path: Path,
@@ -164,214 +827,29 @@ def stream_zip_to_fd(
     verify_drive: bool = True,
     install_mode: str = "installer",
     expected_size: int = 0,
-    cros_debug: bool = False,
-    disable_auto_updates: bool = False,
-    verbose_boot: bool = False,
-    timeout: int = 2,
-    nomodeset: bool = False,
-    unencrypted_stateful: bool = False,
-    force_legacy_boot: bool = False,
+    install_flexshim: bool = False,
+    block_updates: bool = False,
 ) -> None:
-    write_sha1 = hashlib.sha1()
-    written = 0
-    since_sync = 0
-    win_start = time.monotonic()
-    win_bytes = 0
-    bps = 0
-
-    is_togo = install_mode in ("to_go_fresh", "to_go_update")
-    target_write_size = CHROMEOS_OS_PAYLOAD_SIZE if is_togo else image_size
-    logger.info(
-        "Starting stream_source_to_fd: write_fd=%d, target_size=%d, image_size=%d, mode=%s, verify=%s, sha1=%s",
-        write_fd,
-        target_write_size,
-        image_size,
-        install_mode,
-        verify_drive,
-        expected_sha1,
-    )
-
-    if progress_cb is not None:
-        progress_cb("write", 0, target_write_size, 0)
-
-    if install_mode == "to_go_fresh" and expected_size > 0:
-        total_sectors = expected_size // SECTOR_SIZE
-        logger.info("Generating ChromeOS To-Go fresh GPT for total_sectors=%d", total_sectors)
-        boot_code = None
-        try:
-            with open_image_source(archive_path, member_name, image_size) as peek_src:
-                first_sector = peek_src.read(SECTOR_SIZE)
-                if len(first_sector) >= 446 and any(b != 0 for b in first_sector[:446]):
-                    boot_code = first_sector[:446]
-        except Exception as exc:
-            logger.warning("Could not peek source archive MBR: %s", exc)
-
-        mbr = build_protective_mbr(total_sectors, boot_code=boot_code)
-        parts = generate_chromeos_togo_partitions(total_sectors)
-        primary_hdr, entries, backup_hdr = serialize_gpt(total_sectors, parts)
-
-        os.pwrite(write_fd, mbr, 0)
-        os.pwrite(write_fd, primary_hdr, SECTOR_SIZE)
-        os.pwrite(write_fd, entries, 2 * SECTOR_SIZE)
-        os.pwrite(write_fd, entries, (total_sectors - 33) * SECTOR_SIZE)
-        os.pwrite(write_fd, backup_hdr, (total_sectors - 1) * SECTOR_SIZE)
-        os.lseek(write_fd, 34 * SECTOR_SIZE, os.SEEK_SET)
-
-    last_logged_mb = 0
-    with open_image_source(archive_path, member_name, image_size) as src:
-        if install_mode == "to_go_fresh":
-            # Skip LBA 0..33 in the source archive so we don't overwrite our To-Go GPT
-            to_skip = 34 * SECTOR_SIZE
-            while to_skip > 0:
-                discarded = src.read(min(WRITE_BLOCK_SIZE, to_skip))
-                if not discarded:
-                    break
-                write_sha1.update(discarded)
-                to_skip -= len(discarded)
-                written += len(discarded)
-
-        while written < target_write_size:
-            if cancel_check is not None and cancel_check():
-                raise WriteCancelled()
-            to_read = min(WRITE_BLOCK_SIZE, target_write_size - written)
-            chunk = src.read(to_read)
-            if not chunk:
-                break
-            view = memoryview(chunk)
-            offset = 0
-            while offset < len(view):
-                n = os.write(write_fd, view[offset:])
-                if n <= 0:
-                    raise WriteError("Short write to target device.")
-                offset += n
-            write_sha1.update(chunk)
-            written += len(chunk)
-            since_sync += len(chunk)
-            win_bytes += len(chunk)
-
-            if since_sync >= FSYNC_INTERVAL:
-                os.fsync(write_fd)
-                since_sync = 0
-
-            now = time.monotonic()
-            elapsed = now - win_start
-            if elapsed >= 0.4:
-                inst = int(win_bytes / elapsed)
-                bps = inst if bps == 0 else int(bps * 0.6 + inst * 0.4)
-                win_start = now
-                win_bytes = 0
-            if progress_cb is not None:
-                progress_cb("write", written, target_write_size, bps)
-
-            if written - last_logged_mb >= 500 * 1024 * 1024 or written == target_write_size:
-                logger.info(
-                    "Write progress: %d / %d bytes (%.1f%%) @ %d bps",
-                    written,
-                    target_write_size,
-                    (written / target_write_size) * 100 if target_write_size > 0 else 0,
-                    bps,
-                )
-                last_logged_mb = written
-
-    if install_mode == "to_go_fresh":
-        # Zero out the first 16 MiB of the expanded STATE partition so ChromeOS initializes it cleanly
-        state_wipe_len = 16 * 1024 * 1024
-        zero_buf = b"\x00" * (1024 * 1024)
-        for _ in range(16):
-            os.write(write_fd, zero_buf)
-
-    has_custom_boot = (
-        cros_debug
-        or disable_auto_updates
-        or verbose_boot
-        or nomodeset
-        or (timeout != 2)
-        or unencrypted_stateful
-        or force_legacy_boot
-    )
-    if has_custom_boot or is_togo:
-        boot_opts = ChromeOSBootOptions(
-            cros_debug=cros_debug,
-            disable_auto_updates=disable_auto_updates,
-            verbose_boot=verbose_boot,
-            timeout=timeout,
-            nomodeset=nomodeset,
-            unencrypted_stateful=unencrypted_stateful,
-            force_legacy_boot=force_legacy_boot,
-        )
-        patch_grub_in_block_device(write_fd, boot_opts)
-
-    os.fsync(write_fd)
-
-    if written != target_write_size:
-        raise WriteError("Incomplete image stream written to target.")
-    computed_sha1 = write_sha1.hexdigest().lower()
-    if expected_sha1 and computed_sha1 != expected_sha1.lower() and install_mode == "installer" and not has_custom_boot:
-        raise WriteError("Decompressed image SHA-1 did not match expected digest.")
-
-    if not verify_drive:
-        logger.info("Verification skipped by user option.")
-        return
-
-    if before_verify_hook is not None:
-        logger.info("Calling before_verify_hook...")
-        before_verify_hook()
-
-    read_fd = open_read_fd() if open_read_fd is not None else write_fd
-    need_close_read = open_read_fd is not None
-    if not need_close_read:
-        os.lseek(write_fd, 0, os.SEEK_SET)
-
-    logger.info("Beginning read-back verification of %d bytes on fd=%d", target_write_size, read_fd)
-    last_logged_v_mb = 0
+    disk_bytes = expected_size if expected_size > 0 else os.lseek(write_fd, 0, os.SEEK_END)
+    io = PosixBlockIO(write_fd, disk_bytes, open_read_fd=open_read_fd)
     try:
-        verify_sha1 = hashlib.sha1()
-        checked = 0
-        win_start = time.monotonic()
-        win_bytes = 0
-        bps = 0
-        if progress_cb is not None:
-            progress_cb("verify", 0, target_write_size, 0)
-
-        while checked < target_write_size:
-            if cancel_check is not None and cancel_check():
-                raise WriteCancelled()
-            to_read = min(WRITE_BLOCK_SIZE, target_write_size - checked)
-            buf = os.read(read_fd, to_read)
-            if not buf:
-                raise WriteError("Unexpected EOF during read-back verification.")
-            verify_sha1.update(buf)
-            checked += len(buf)
-            win_bytes += len(buf)
-
-            now = time.monotonic()
-            elapsed = now - win_start
-            if elapsed >= 0.4:
-                inst = int(win_bytes / elapsed)
-                bps = inst if bps == 0 else int(bps * 0.6 + inst * 0.4)
-                win_start = now
-                win_bytes = 0
-            if progress_cb is not None:
-                progress_cb("verify", checked, target_write_size, bps)
-
-            if checked - last_logged_v_mb >= 500 * 1024 * 1024 or checked == target_write_size:
-                logger.info(
-                    "Verify progress: %d / %d bytes (%.1f%%) @ %d bps",
-                    checked,
-                    target_write_size,
-                    (checked / target_write_size) * 100 if target_write_size > 0 else 0,
-                    bps,
-                )
-                last_logged_v_mb = checked
-
-        v_hex = verify_sha1.hexdigest().lower()
-        logger.info("Read-back verification completed. Checksum: %s", v_hex)
-        if v_hex != computed_sha1 and install_mode == "installer" and not has_custom_boot:
-            raise WriteError("Verification failed: data read back from drive did not match image SHA-1.")
-        logger.info("Drive verification successful!")
+        write_image_to_block_io(
+            archive_path=archive_path,
+            member_name=member_name,
+            image_size=image_size,
+            expected_sha1=expected_sha1,
+            io=io,
+            progress_cb=progress_cb,
+            cancel_check=cancel_check,
+            before_verify_hook=before_verify_hook,
+            verify_drive=verify_drive,
+            install_mode=install_mode,
+            expected_size=disk_bytes,
+            install_flexshim=install_flexshim,
+            block_updates=block_updates,
+        )
     finally:
-        if need_close_read:
-            os.close(read_fd)
+        io.close_read_fd()
 
 
 def execute_write(
@@ -516,15 +994,6 @@ def run_writer_cli(argv: list[str]) -> int:
                     send_msg({"event": "pong"})
                 elif cmd == "cancel":
                     active_cancel.set()
-                elif cmd == "read_boot_options":
-                    dev = str(msg.get("device") or "")
-                    opts = read_chromeos_boot_options(dev)
-                    send_msg({"event": "boot_options", "options": opts.to_dict() if opts else None})
-                elif cmd == "patch_boot_options":
-                    dev = str(msg.get("device") or "")
-                    opts_dict = msg.get("options") or {}
-                    ok = patch_grub_in_block_device(dev, ChromeOSBootOptions.from_dict(opts_dict))
-                    send_msg({"event": "boot_options_patched", "ok": ok})
                 elif cmd == "write":
                     active_cancel.clear()
                     spec_dict = msg.get("spec") or {}

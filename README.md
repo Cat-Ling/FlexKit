@@ -37,3 +37,7 @@ Windows (PowerShell):
 ```
 
 Artifacts and `.sha256` digests are written to `dist/`.
+
+## License
+
+GNU General Public License v3.0 or later. See [LICENSE](LICENSE).

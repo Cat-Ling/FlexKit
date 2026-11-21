@@ -22,5 +22,6 @@ VENV_DIR="$(CDPATH= cd -- "$VENV_DIR" && pwd -P)"
 
 "$VENV_DIR/bin/python" -m pip install --upgrade pip
 "$VENV_DIR/bin/python" -m pip install -r requirements-dev.txt
-"$VENV_DIR/bin/python" -m pytest -q
-"$VENV_DIR/bin/python" scripts/build.py "$@"
+"$VENV_DIR/bin/python" scripts/build.py --build-flexshim-only
+QT_QPA_PLATFORM=offscreen "$VENV_DIR/bin/python" -m pytest -q
+"$VENV_DIR/bin/python" scripts/build.py --skip-flexshim-build "$@"

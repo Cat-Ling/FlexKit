@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Callable
 import ctypes
 from ctypes import wintypes
-import hashlib
 import mmap
 import re
 import sys
@@ -18,13 +17,11 @@ from flexkit.drives.windows import (
     _VOLUME_DISK_EXTENTS,
 )
 from flexkit.writer import (
-    CHROMEOS_OS_PAYLOAD_SIZE,
     WRITE_BLOCK_SIZE,
-    WriteCancelled,
     WriteError,
     WriteProgressCallback,
     WriteSpec,
-    open_image_source,
+    write_image_to_block_io,
 )
 
 _PHYS_DRIVE_RE = re.compile(r"^\\\\\.\\PhysicalDrive([1-9]\d*)$")
@@ -40,6 +37,138 @@ FSCTL_ALLOW_EXTENDED_DASD_IO = 0x00090083
 IOCTL_DISK_DELETE_DRIVE_LAYOUT = 0x0007C100
 IOCTL_DISK_UPDATE_PROPERTIES = 0x00070140
 SECTOR_SIZE = 512
+
+
+def _make_kernel32() -> ctypes.WinDLL:
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    lpvoid = ctypes.c_void_p
+    lpdword = ctypes.POINTER(wintypes.DWORD)
+
+    k32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        lpvoid,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    k32.CreateFileW.restype = wintypes.HANDLE
+
+    k32.DeviceIoControl.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        lpvoid,
+        wintypes.DWORD,
+        lpvoid,
+        wintypes.DWORD,
+        lpdword,
+        lpvoid,
+    ]
+    k32.DeviceIoControl.restype = wintypes.BOOL
+
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
+
+    k32.FindFirstVolumeW.argtypes = [wintypes.LPWSTR, wintypes.DWORD]
+    k32.FindFirstVolumeW.restype = wintypes.HANDLE
+
+    k32.FindNextVolumeW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD]
+    k32.FindNextVolumeW.restype = wintypes.BOOL
+
+    k32.FindVolumeClose.argtypes = [wintypes.HANDLE]
+    k32.FindVolumeClose.restype = wintypes.BOOL
+
+    k32.SetFilePointerEx.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_longlong,
+        ctypes.POINTER(ctypes.c_longlong),
+        wintypes.DWORD,
+    ]
+    k32.SetFilePointerEx.restype = wintypes.BOOL
+
+    k32.WriteFile.argtypes = [wintypes.HANDLE, lpvoid, wintypes.DWORD, lpdword, lpvoid]
+    k32.WriteFile.restype = wintypes.BOOL
+
+    k32.ReadFile.argtypes = [wintypes.HANDLE, lpvoid, wintypes.DWORD, lpdword, lpvoid]
+    k32.ReadFile.restype = wintypes.BOOL
+
+    k32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    k32.FlushFileBuffers.restype = wintypes.BOOL
+    return k32
+
+
+class _Win32BlockIO:
+    def __init__(self, kernel32: ctypes.WinDLL, h_disk: int, size: int) -> None:
+        self._kernel32 = kernel32
+        self._h_disk = h_disk
+        self._size = size
+        self._buf = mmap.mmap(-1, WRITE_BLOCK_SIZE)
+        self._buf_addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def close(self) -> None:
+        self._buf.close()
+
+    def _seek(self, offset: int) -> None:
+        new_pos = ctypes.c_longlong(0)
+        if not self._kernel32.SetFilePointerEx(self._h_disk, ctypes.c_longlong(offset), ctypes.byref(new_pos), 0):
+            raise WriteError(f"Failed to seek target disk to offset {offset} (error {ctypes.get_last_error()}).")
+
+    def write_at(self, offset: int, data: bytes | memoryview) -> None:
+        if offset % SECTOR_SIZE != 0:
+            raise WriteError(f"Unaligned disk write offset {offset}.")
+        view = memoryview(data)
+        pos = 0
+        total = len(view)
+        while pos < total:
+            raw_len = min(WRITE_BLOCK_SIZE, total - pos)
+            pad_len = (SECTOR_SIZE - (raw_len % SECTOR_SIZE)) % SECTOR_SIZE
+            io_len = raw_len + pad_len
+            self._buf[:raw_len] = view[pos : pos + raw_len]
+            if pad_len:
+                self._buf[raw_len:io_len] = b"\x00" * pad_len
+
+            self._seek(offset + pos)
+            bytes_written = wintypes.DWORD(0)
+            if not self._kernel32.WriteFile(
+                self._h_disk,
+                ctypes.c_void_p(self._buf_addr),
+                io_len,
+                ctypes.byref(bytes_written),
+                None,
+            ) or int(bytes_written.value) != io_len:
+                raise WriteError(f"Disk write failed (error {ctypes.get_last_error()}).")
+            pos += raw_len
+
+    def read_at(self, offset: int, size: int) -> bytes:
+        aligned_off = (offset // SECTOR_SIZE) * SECTOR_SIZE
+        lead_pad = offset - aligned_off
+        total_need = lead_pad + size
+        out = bytearray()
+        pos = 0
+        while pos < total_need:
+            want = min(WRITE_BLOCK_SIZE, total_need - pos)
+            io_want = want + ((SECTOR_SIZE - (want % SECTOR_SIZE)) % SECTOR_SIZE)
+            self._seek(aligned_off + pos)
+            bytes_read = wintypes.DWORD(0)
+            if not self._kernel32.ReadFile(
+                self._h_disk,
+                ctypes.c_void_p(self._buf_addr),
+                io_want,
+                ctypes.byref(bytes_read),
+                None,
+            ) or int(bytes_read.value) < want:
+                raise WriteError(f"Disk read failed (error {ctypes.get_last_error()}).")
+            out.extend(memoryview(self._buf)[:want])
+            pos += want
+        return bytes(memoryview(out)[lead_pad : lead_pad + size])
+
+    def flush(self) -> None:
+        self._kernel32.FlushFileBuffers(self._h_disk)
 
 
 def _lock_and_dismount_volumes(kernel32: ctypes.WinDLL, disk_num: int) -> list[int]:
@@ -133,7 +262,7 @@ def write_physical_drive(
         raise WriteError(f"Refusing invalid Windows target device: {spec.device!r}")
     disk_num = int(m.group(1))
 
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = _make_kernel32()
     locked_vols = _lock_and_dismount_volumes(kernel32, disk_num)
     h_disk = INVALID_HANDLE_VALUE
 
@@ -148,121 +277,33 @@ def write_physical_drive(
             None,
         )
         if h_disk == INVALID_HANDLE_VALUE:
-            raise WriteError(f"Failed to open {spec.device} (error {kernel32.GetLastError()}).")
+            raise WriteError(f"Failed to open {spec.device} (error {ctypes.get_last_error()}).")
 
         ret = wintypes.DWORD(0)
         kernel32.DeviceIoControl(h_disk, FSCTL_ALLOW_EXTENDED_DASD_IO, None, 0, None, 0, ctypes.byref(ret), None)
-        kernel32.DeviceIoControl(h_disk, IOCTL_DISK_DELETE_DRIVE_LAYOUT, None, 0, None, 0, ctypes.byref(ret), None)
+        if spec.install_mode != "to_go_update":
+            kernel32.DeviceIoControl(h_disk, IOCTL_DISK_DELETE_DRIVE_LAYOUT, None, 0, None, 0, ctypes.byref(ret), None)
 
-        aligned_buf = mmap.mmap(-1, WRITE_BLOCK_SIZE)
+        win_io = _Win32BlockIO(kernel32, h_disk, spec.expected_size)
         try:
-            buf_addr = ctypes.addressof(ctypes.c_char.from_buffer(aligned_buf))
-            is_togo = spec.install_mode in ("to_go_fresh", "to_go_update")
-            target_write_size = CHROMEOS_OS_PAYLOAD_SIZE if is_togo else spec.image_size
-
-            write_sha1 = hashlib.sha1()
-            written = 0
-            win_start = time.monotonic()
-            win_bytes = 0
-            bps = 0
-            if progress_cb is not None:
-                progress_cb("write", 0, target_write_size, 0)
-
-            with open_image_source(spec.archive_path, spec.member_name, spec.image_size) as src:
-                while written < target_write_size:
-                    if cancel_check is not None and cancel_check():
-                        raise WriteCancelled()
-                    to_read = min(WRITE_BLOCK_SIZE, target_write_size - written)
-                    chunk = src.read(to_read)
-                    if not chunk:
-                        break
-                    write_sha1.update(chunk)
-                    raw_len = len(chunk)
-                    pad_len = (SECTOR_SIZE - (raw_len % SECTOR_SIZE)) % SECTOR_SIZE
-                    io_len = raw_len + pad_len
-                    aligned_buf[:raw_len] = chunk
-                    if pad_len:
-                        aligned_buf[raw_len:io_len] = b"\x00" * pad_len
-
-                    bytes_written = wintypes.DWORD(0)
-                    if not kernel32.WriteFile(
-                        h_disk,
-                        ctypes.c_void_p(buf_addr),
-                        io_len,
-                        ctypes.byref(bytes_written),
-                        None,
-                    ) or int(bytes_written.value) != io_len:
-                        raise WriteError(f"Disk write failed (error {kernel32.GetLastError()}).")
-
-                    written += raw_len
-                    win_bytes += raw_len
-                    now = time.monotonic()
-                    elapsed = now - win_start
-                    if elapsed >= 0.4:
-                        inst = int(win_bytes / elapsed)
-                        bps = inst if bps == 0 else int(bps * 0.6 + inst * 0.4)
-                        win_start = now
-                        win_bytes = 0
-                    if progress_cb is not None:
-                        progress_cb("write", written, target_write_size, bps)
-
-            kernel32.FlushFileBuffers(h_disk)
-            computed_sha1 = write_sha1.hexdigest().lower()
-            if written != target_write_size or (
-                spec.expected_sha1 and computed_sha1 != spec.expected_sha1.lower() and spec.install_mode == "installer"
-            ):
-                raise WriteError("Image write stream verification failed.")
-
-            if not spec.verify_drive:
-                kernel32.DeviceIoControl(h_disk, IOCTL_DISK_UPDATE_PROPERTIES, None, 0, None, 0, ctypes.byref(ret), None)
-                return
-
-            new_pos = ctypes.c_longlong(0)
-            if not kernel32.SetFilePointerEx(h_disk, ctypes.c_longlong(0), ctypes.byref(new_pos), 0):
-                raise WriteError("Failed to seek disk for verification.")
-
-            verify_sha1 = hashlib.sha1()
-            checked = 0
-            win_start = time.monotonic()
-            win_bytes = 0
-            bps = 0
-            if progress_cb is not None:
-                progress_cb("verify", 0, target_write_size, 0)
-
-            while checked < target_write_size:
-                if cancel_check is not None and cancel_check():
-                    raise WriteCancelled()
-                want = min(WRITE_BLOCK_SIZE, target_write_size - checked)
-                io_want = want + ((SECTOR_SIZE - (want % SECTOR_SIZE)) % SECTOR_SIZE)
-                bytes_read = wintypes.DWORD(0)
-                if not kernel32.ReadFile(
-                    h_disk,
-                    ctypes.c_void_p(buf_addr),
-                    io_want,
-                    ctypes.byref(bytes_read),
-                    None,
-                ) or int(bytes_read.value) < want:
-                    raise WriteError(f"Disk verification read failed (error {kernel32.GetLastError()}).")
-
-                verify_sha1.update(memoryview(aligned_buf)[:want])
-                checked += want
-                win_bytes += want
-                now = time.monotonic()
-                elapsed = now - win_start
-                if elapsed >= 0.4:
-                    inst = int(win_bytes / elapsed)
-                    bps = inst if bps == 0 else int(bps * 0.6 + inst * 0.4)
-                    win_start = now
-                    win_bytes = 0
-                if progress_cb is not None:
-                    progress_cb("verify", checked, target_write_size, bps)
-
-            if verify_sha1.hexdigest().lower() != computed_sha1 and spec.install_mode == "installer":
-                raise WriteError("Verification failed: data read back from drive did not match image SHA-1.")
-
+            write_image_to_block_io(
+                archive_path=spec.archive_path,
+                member_name=spec.member_name,
+                image_size=spec.image_size,
+                expected_sha1=spec.expected_sha1,
+                io=win_io,
+                progress_cb=progress_cb,
+                cancel_check=cancel_check,
+                before_verify_hook=None,
+                verify_drive=spec.verify_drive,
+                install_mode=spec.install_mode,
+                expected_size=spec.expected_size,
+                install_flexshim=spec.install_flexshim,
+                block_updates=spec.block_updates,
+            )
             kernel32.DeviceIoControl(h_disk, IOCTL_DISK_UPDATE_PROPERTIES, None, 0, None, 0, ctypes.byref(ret), None)
         finally:
-            aligned_buf.close()
+            win_io.close()
     finally:
         if h_disk != INVALID_HANDLE_VALUE:
             kernel32.CloseHandle(h_disk)
