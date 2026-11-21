@@ -1,6 +1,6 @@
 # FlexKit
 
-Cross-platform **ChromeOS Flex** downloader and bootable USB installer for Linux, Windows, macOS, and FreeBSD.
+Cross-platform **ChromeOS Flex** downloader and bootable USB installer for Linux, Windows, and macOS.
 
 ## Features
 
@@ -26,7 +26,7 @@ python3 scripts/version.py bump patch
 
 ## Building native binaries
 
-Linux / macOS / FreeBSD:
+Linux / macOS:
 ```sh
 ./scripts/build.sh
 ```

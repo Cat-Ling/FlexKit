@@ -788,7 +788,6 @@ def test_build_script_target_commands_and_icons(tmp_path: Path) -> None:
         ("linux", "pyside6", "--onefile"),
         ("win32", "pyside6", "--windows-console-mode=disable"),
         ("darwin", "pyside6", "--macos-create-app-bundle"),
-        ("freebsd15", "pyqt6", "--enable-plugin=pyqt6"),
     ):
         cmd = mod.build_nuitka_command(
             python_exe=sys.executable,
@@ -801,7 +800,7 @@ def test_build_script_target_commands_and_icons(tmp_path: Path) -> None:
         assert expected_flag in cmd
         assert any(arg.startswith("--include-data-dir=") for arg in cmd)
         assert "--output-filename=flexkit" not in cmd
-        if plat in ("darwin", "freebsd15"):
+        if plat == "darwin":
             assert "--output-filename=flexkit.bin" in cmd
 
 

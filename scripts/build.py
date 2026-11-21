@@ -93,8 +93,6 @@ def _norm_os() -> str:
         return "windows"
     if sys.platform == "darwin":
         return "macos"
-    if "bsd" in sys.platform:
-        return sys.platform
     return sys.platform
 
 
@@ -203,11 +201,6 @@ def build_nuitka_command(
             f"--macos-app-name={APP_NAME}",
             f"--macos-app-icon={icons['icns']}",
             f"--macos-app-version={__version__}",
-            f"--output-filename={APP_SLUG}.bin",
-        ]
-    elif "bsd" in target_platform:
-        cmd += [
-            "--standalone",
             f"--output-filename={APP_SLUG}.bin",
         ]
     else:
@@ -332,15 +325,6 @@ def main(argv: list[str] | None = None) -> int:
             if attempt == 2:
                 raise subprocess.CalledProcessError(res.returncode, hdiutil_cmd)
             time.sleep(2)
-    elif "bsd" in sys.platform:
-        dist_folders = list(work_dir.glob("*.dist"))
-        if not dist_folders:
-            raise RuntimeError("Nuitka did not emit a standalone .dist directory")
-        artifact = dist_dir / f"{stem}.tar.gz"
-        subprocess.run(
-            ["tar", "-czf", str(artifact), "-C", str(work_dir), dist_folders[0].name],
-            check=True,
-        )
     else:
         artifact = dist_dir / f"{stem}.bin"
         shutil.copy2(work_dir / f"{stem}.bin", artifact)

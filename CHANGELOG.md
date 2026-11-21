@@ -6,7 +6,7 @@
 - Removed all ChromeOS binary/bootloader patching to preserve Verified Boot integrity.
 - Bundled `flexshim` UEFI compatibility shim (`flexshimx64.efi` + `flexshim.cfg`) with Advanced Boot Options for fixing UEFI boot panics on older PCs and disabling automatic updates via config.
 - Switched FlexKit license to GPL-3.0-or-later.
-- Fixed Windows, macOS (`arm64` & `x86_64`), and FreeBSD builds, tests, and GitHub Actions release pipeline.
+- Fixed Windows and macOS (`arm64` & `x86_64`) builds, tests, and GitHub Actions release pipeline; dropped FreeBSD target.
 
 ## [0.0.1] - 2026-11-08
 

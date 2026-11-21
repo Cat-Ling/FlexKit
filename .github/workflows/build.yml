@@ -81,73 +81,9 @@ jobs:
           path: |
             dist/*
 
-  freebsd-build:
-    name: Build (freebsd)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-uefi
-
-      - name: Build and test flexshim (UEFI)
-        run: |
-          cargo test --lib --manifest-path flexshim/Cargo.toml
-          python3 scripts/build.py --build-flexshim-only
-
-      - name: Test and build on FreeBSD
-        uses: vmactions/freebsd-vm@v1
-        with:
-          usesh: true
-          prepare: |
-            set -eu
-            pkg update
-            PY_PKG="$(pkg rquery '%n' | grep -E '^py3[0-9]+-pyside6$' | sort -V | tail -n 1 || true)"
-            QT_PLUGIN="pyside6"
-            if [ -z "$PY_PKG" ]; then
-              PY_PKG="$(pkg rquery '%n' | grep -E '^py3[0-9]+-qt6-pyqt$' | sort -V | tail -n 1 || true)"
-              QT_PLUGIN="pyqt6"
-            fi
-            if [ -z "$PY_PKG" ]; then
-              echo "No PySide6 or PyQt6 package found in pkg repository" >&2
-              exit 1
-            fi
-            PY_FLAVOR="${PY_PKG%%-*}"
-            PY_MINOR="${PY_FLAVOR#py3}"
-            PY_VER="3.${PY_MINOR}"
-            pkg install -y "python3${PY_MINOR}" "${PY_FLAVOR}-pip" "${PY_FLAVOR}-setuptools" "$PY_PKG" "${PY_FLAVOR}-pytest" "${PY_FLAVOR}-zstandard" patchelf ccache git
-            cat > /tmp/flexkit-freebsd-env.sh <<EOF
-            export PY_BIN="python${PY_VER}"
-            export QT_PLUGIN="${QT_PLUGIN}"
-            EOF
-          run: |
-            set -eu
-            . /tmp/flexkit-freebsd-env.sh
-            if "$PY_BIN" -m venv --system-site-packages /tmp/nuitka-venv 2>/dev/null; then
-              /tmp/nuitka-venv/bin/python -m pip install --upgrade "nuitka>=2.5"
-              PY_RUN=/tmp/nuitka-venv/bin/python
-            else
-              rm -rf /tmp/nuitka-venv
-              PIP_BREAK_SYSTEM_PACKAGES=1 "$PY_BIN" -m pip install "nuitka>=2.5"
-              PY_RUN="$PY_BIN"
-            fi
-            QT_QPA_PLATFORM=offscreen PYTHONPATH=src "$PY_RUN" -m pytest -q
-            "$PY_RUN" scripts/build.py --qt-plugin="$QT_PLUGIN" --skip-flexshim-build
-            build/nuitka/*.dist/flexkit.bin --version
-            test -f build/nuitka/*.dist/flexkit/assets/flexshim/flexshimx64.efi
-            test -f build/nuitka/*.dist/flexkit/assets/flexshim/flexshim.cfg
-
-      - uses: actions/upload-artifact@v5
-        with:
-          name: dist-freebsd
-          path: |
-            dist/*
-
   release:
     name: Publish Release
-    needs: [native-build, freebsd-build]
+    needs: [native-build]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
