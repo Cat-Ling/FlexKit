@@ -299,7 +299,8 @@ def write_physical_drive(
                 install_mode=spec.install_mode,
                 expected_size=spec.expected_size,
                 install_flexshim=spec.install_flexshim,
-                block_updates=spec.block_updates,
+                cros_debug=spec.cros_debug,
+                disable_updates=spec.disable_updates,
             )
             kernel32.DeviceIoControl(h_disk, IOCTL_DISK_UPDATE_PROPERTIES, None, 0, None, 0, ctypes.byref(ret), None)
         finally:

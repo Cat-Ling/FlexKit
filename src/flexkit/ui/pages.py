@@ -347,7 +347,7 @@ class DrivePage(QtWidgets.QWidget):
             parent=self.options_card,
         )
         self.keep_data_tile.setVisible(False)
-        self.keep_data_tile.toggled.connect(lambda _checked: self.selection_changed.emit())
+        self.keep_data_tile.toggled.connect(self._on_keep_data_toggled)
         opt_lay.addWidget(self.keep_data_tile)
         self.keep_data_cb = self.keep_data_tile
 
@@ -369,13 +369,22 @@ class DrivePage(QtWidgets.QWidget):
         self.flexshim_tile.toggled.connect(self._on_flexshim_toggled)
         adv_lay.addWidget(self.flexshim_tile)
 
-        self.block_updates_tile = BootOptionTile(
-            "Disable Automatic Updates",
-            "Sets block_updates=true in flexshim.cfg to block background ChromeOS Flex OTA updates without modifying OS partitions (requires flexshim; also enables crosh shell/VT2).",
+        self.cros_debug_tile = BootOptionTile(
+            "Enable Developer Shell & Debug Mode (cros_debug)",
+            "Sets cros_debug=true in flexshim.cfg to append cros_debug to the kernel command line. Enables crosh shell, VT2 root console (Ctrl+Alt+F2), stateful lsb-release overrides, and blocks periodic background update checks (requires flexshim).",
             parent=self.adv_container,
         )
-        self.block_updates_tile.toggled.connect(self._on_block_updates_toggled)
-        adv_lay.addWidget(self.block_updates_tile)
+        self.cros_debug_tile.toggled.connect(self._on_cros_debug_toggled)
+        adv_lay.addWidget(self.cros_debug_tile)
+
+        self.disable_updates_tile = BootOptionTile(
+            "Disable ChromeOS Updates (OOBE, Settings & Background)",
+            "",
+            parent=self.adv_container,
+        )
+        self.disable_updates_tile.toggled.connect(self._on_disable_updates_toggled)
+        adv_lay.addWidget(self.disable_updates_tile)
+        self._sync_disable_updates_availability()
 
         self.adv_container.setVisible(False)
         opt_lay.addWidget(self.adv_container)
@@ -406,6 +415,34 @@ class DrivePage(QtWidgets.QWidget):
         ctrl_row.addWidget(self.refresh_btn, 0)
         lay.addLayout(ctrl_row)
 
+    @staticmethod
+    def _set_tile_checked(tile: BootOptionTile, checked: bool) -> None:
+        if tile.isChecked() == checked:
+            return
+        tile.blockSignals(True)
+        tile.setChecked(checked)
+        tile.blockSignals(False)
+
+    def _sync_disable_updates_availability(self) -> None:
+        mode = self.install_mode()
+        if mode == "to_go_fresh":
+            self.disable_updates_tile.setEnabled(True)
+            self.disable_updates_tile.set_description(
+                "Writes CHROMEOS_RELEASE_VERSION=99999.0.0 to H-STATE /etc/lsb-release and enables flexshim + cros_debug so OOBE setup, Settings checks, and background updates all cleanly skip updating without touching OS partitions."
+            )
+            return
+
+        self._set_tile_checked(self.disable_updates_tile, False)
+        self.disable_updates_tile.setEnabled(False)
+        if mode == "installer":
+            self.disable_updates_tile.set_description(
+                "Only available for ChromeOS To Go fresh installs (chromeos-install formats a new STATE partition without copying /etc/lsb-release; enable cros_debug above and create /mnt/stateful_partition/etc/lsb-release after installing)."
+            )
+        else:
+            self.disable_updates_tile.set_description(
+                "Only available for ChromeOS To Go fresh installs (OS-only updates preserve your existing H-STATE partition untouched; keep cros_debug enabled above if updates were previously disabled)."
+            )
+
     def _on_mode_changed(self, _idx: int) -> None:
         drv = self.selected_drive()
         has_cros = drv is not None and drv.has_chromeos
@@ -416,6 +453,11 @@ class DrivePage(QtWidgets.QWidget):
             else "Creates a standard ChromeOS Flex USB installer to try or install on a PC's internal drive."
         )
         self.keep_data_tile.setVisible(has_cros and is_togo)
+        self._sync_disable_updates_availability()
+        self.selection_changed.emit()
+
+    def _on_keep_data_toggled(self, _checked: bool) -> None:
+        self._sync_disable_updates_availability()
         self.selection_changed.emit()
 
     def _toggle_advanced_options(self) -> None:
@@ -424,29 +466,41 @@ class DrivePage(QtWidgets.QWidget):
         self.adv_btn.setText("▾ Advanced Boot Options" if visible else "▸ Advanced Boot Options")
 
     def _on_flexshim_toggled(self, checked: bool) -> None:
-        if not checked and self.block_updates_tile.isChecked():
-            self.block_updates_tile.blockSignals(True)
-            self.block_updates_tile.setChecked(False)
-            self.block_updates_tile.blockSignals(False)
+        if not checked:
+            self._set_tile_checked(self.cros_debug_tile, False)
+            self._set_tile_checked(self.disable_updates_tile, False)
         self.selection_changed.emit()
 
-    def _on_block_updates_toggled(self, checked: bool) -> None:
-        if checked and not self.flexshim_tile.isChecked():
-            self.flexshim_tile.blockSignals(True)
-            self.flexshim_tile.setChecked(True)
-            self.flexshim_tile.blockSignals(False)
+    def _on_cros_debug_toggled(self, checked: bool) -> None:
+        if checked:
+            self._set_tile_checked(self.flexshim_tile, True)
+        else:
+            self._set_tile_checked(self.disable_updates_tile, False)
+        self.selection_changed.emit()
+
+    def _on_disable_updates_toggled(self, checked: bool) -> None:
+        if checked:
+            self._set_tile_checked(self.flexshim_tile, True)
+            self._set_tile_checked(self.cros_debug_tile, True)
         self.selection_changed.emit()
 
     def install_flexshim_checked(self) -> bool:
-        return self.flexshim_tile.isChecked() or self.block_updates_tile.isChecked()
+        return (
+            self.flexshim_tile.isChecked()
+            or self.cros_debug_tile.isChecked()
+            or self.disable_updates_tile.isChecked()
+        )
 
-    def block_updates_checked(self) -> bool:
-        return self.block_updates_tile.isChecked()
+    def cros_debug_checked(self) -> bool:
+        return self.cros_debug_tile.isChecked() or self.disable_updates_tile.isChecked()
+
+    def disable_updates_checked(self) -> bool:
+        return self.disable_updates_tile.isEnabled() and self.disable_updates_tile.isChecked()
 
     def install_mode(self) -> str:
         data = self.mode_dropdown.current_data()
         if data == "to_go":
-            if self.keep_data_tile.isVisible() and self.keep_data_tile.isChecked():
+            if self.keep_data_tile.isVisibleTo(self.options_card) and self.keep_data_tile.isChecked():
                 return "to_go_update"
             return "to_go_fresh"
         return "installer"
@@ -512,6 +566,7 @@ class DrivePage(QtWidgets.QWidget):
             self.keep_data_tile.setVisible(False)
             self.keep_data_tile.setChecked(False)
 
+        self._sync_disable_updates_availability()
         self.selection_changed.emit()
 
 

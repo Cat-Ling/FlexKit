@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.0] - 2026-11-22
+
+- Split `cros_debug` into its own accurate option in `flexshim.cfg` (`cros_debug=true`) and FlexKit's Advanced Boot Options (enables `crosh` `shell`, VT2 root console, stateful `lsb-release` overrides, and blocks periodic background update checks).
+- Implemented full ChromeOS update suppression (OOBE, Settings, and background checks) for ChromeOS To Go fresh installs by writing `CHROMEOS_RELEASE_VERSION=99999.0.0` into `H-STATE` `/etc/lsb-release` with read-back verification, alongside `cros_debug=true`.
+- Added mode-aware UI availability and fail-fast writer guards clarifying that automatic update suppression applies to ChromeOS To Go fresh installs (not USB Installer or OS-only To Go updates).
+
 ## [1.0.0] - 2026-11-21
 
 - Genuine ChromeOS Flex To Go mode matching `write_base_table` (4 GiB `ROOT-B`/`ROOT-A`, expanded pure-Python `H-STATE` ext4 partition, preserved partition GUIDs, unmodified signed OS partitions, and in-place To Go OS updates preserving user data).

@@ -167,6 +167,72 @@ def _build_journal_superblock(fs_uuid: uuid.UUID, journal_blocks: int) -> bytes:
     return bytes(blk)
 
 
+def _read_first_extent_info(inode_bytes: bytes) -> tuple[int, int, int]:
+    mode, _, size_lo = struct.unpack_from("<HHI", inode_bytes, 0x00)
+    size_hi = struct.unpack_from("<I", inode_bytes, 0x6C)[0]
+    size_bytes = size_lo | (size_hi << 32)
+    eh_magic, eh_entries = struct.unpack_from("<HH", inode_bytes, 0x28)
+    if eh_magic != EXT4_EXTENT_MAGIC or eh_entries < 1:
+        raise ValueError("Invalid ext4 extent header in H-STATE inode.")
+    _ee_block, _ee_len, ee_start_hi, ee_start_lo = struct.unpack_from("<IHHI", inode_bytes, 0x34)
+    start_block = ee_start_lo | (ee_start_hi << 32)
+    return mode, size_bytes, start_block
+
+
+def _dir_block_has_entry(blk: bytes, target_ino: int, target_name: str, expected_ftype: int) -> bool:
+    name_bytes = target_name.encode("utf-8")
+    pos = 0
+    limit = BLOCK_SIZE - 12
+    while pos + 8 <= limit:
+        ino, rec_len, name_len, ftype = struct.unpack_from("<IHBB", blk, pos)
+        if rec_len < 8 or pos + rec_len > BLOCK_SIZE:
+            break
+        if ino == target_ino and ftype == expected_ftype and name_len == len(name_bytes):
+            if blk[pos + 8 : pos + 8 + name_len] == name_bytes:
+                return True
+        pos += rec_len
+    return False
+
+
+def verify_ext4_etc_lsb_release(
+    read_at: Callable[[int, int], bytes],
+    partition_offset: int,
+    expected: bytes,
+) -> None:
+    """Verify `/etc/lsb-release` inside a freshly formatted H-STATE ext4 partition."""
+    sb = read_at(partition_offset + 1024, 1024)
+    if len(sb) < 1024 or sb[0x38:0x3A] != b"\x53\xEF":
+        raise ValueError("H-STATE ext4 superblock magic missing.")
+
+    gd0 = read_at(partition_offset + BLOCK_SIZE, 512)
+    it_lo = struct.unpack_from("<I", gd0, 8)[0]
+    it_hi = struct.unpack_from("<I", gd0, 40)[0]
+    it_blk = it_lo | (it_hi << 32)
+
+    it_blk0 = read_at(partition_offset + it_blk * BLOCK_SIZE, BLOCK_SIZE)
+
+    root_mode, _root_sz, root_blk = _read_first_extent_info(it_blk0[1 * INODE_SIZE : 2 * INODE_SIZE])
+    if (root_mode & 0xF000) != 0x4000:
+        raise ValueError("H-STATE root inode is not a directory.")
+    if not _dir_block_has_entry(read_at(partition_offset + root_blk * BLOCK_SIZE, BLOCK_SIZE), 12, "etc", 2):
+        raise ValueError("H-STATE root directory is missing /etc entry.")
+
+    etc_mode, _etc_sz, etc_blk = _read_first_extent_info(it_blk0[11 * INODE_SIZE : 12 * INODE_SIZE])
+    if (etc_mode & 0xF000) != 0x4000:
+        raise ValueError("H-STATE /etc inode is not a directory.")
+    if not _dir_block_has_entry(read_at(partition_offset + etc_blk * BLOCK_SIZE, BLOCK_SIZE), 13, "lsb-release", 1):
+        raise ValueError("H-STATE /etc directory is missing lsb-release entry.")
+
+    lsb_mode, lsb_size, lsb_blk = _read_first_extent_info(it_blk0[12 * INODE_SIZE : 13 * INODE_SIZE])
+    if (lsb_mode & 0xF000) != 0x8000:
+        raise ValueError("H-STATE /etc/lsb-release inode is not a regular file.")
+    if lsb_size != len(expected):
+        raise ValueError("H-STATE /etc/lsb-release file size mismatch.")
+    data = read_at(partition_offset + lsb_blk * BLOCK_SIZE, BLOCK_SIZE)
+    if data[:lsb_size] != expected:
+        raise ValueError("H-STATE /etc/lsb-release contents did not match expected data.")
+
+
 def format_ext4_partition(
     write_at: Callable[[int, bytes | memoryview], None],
     partition_offset: int,
@@ -175,10 +241,13 @@ def format_ext4_partition(
     label: str = "H-STATE",
     fs_uuid: uuid.UUID | None = None,
     timestamp: int | None = None,
+    etc_lsb_release: bytes | None = None,
 ) -> None:
     """Format an ext4 filesystem matching ChromeOS H-STATE directly over a byte-offset writer."""
     if partition_size < 64 * 1024 * 1024:
         raise ValueError(f"Partition size {partition_size} bytes is too small for ext4 H-STATE.")
+    if etc_lsb_release is not None and not (0 < len(etc_lsb_release) <= BLOCK_SIZE):
+        raise ValueError(f"etc_lsb_release size ({len(etc_lsb_release)}) must be between 1 and {BLOCK_SIZE} bytes.")
 
     # Clear leading and trailing superblock regions before writing new metadata.
     zero_1m = b"\x00" * (1024 * 1024)
@@ -220,10 +289,17 @@ def format_ext4_partition(
     fs_seed = crc32c_raw(0xFFFFFFFF, uid.bytes)
     hash_seed = os.urandom(16)
 
+    has_etc_lsb = etc_lsb_release is not None
+    g0_used_inodes = 13 if has_etc_lsb else 11
+    g0_dirs = 3 if has_etc_lsb else 2
+    g0_extra_blocks = (4 if has_etc_lsb else 2) + journal_blocks
+
     g0_overhead = 1 + gdt_blocks + 2 + INODE_TABLE_BLOCKS
     root_dir_blk = g0_overhead
     lost_found_blk = root_dir_blk + 1
-    journal_start_blk = lost_found_blk + 1
+    etc_dir_blk = lost_found_blk + 1
+    lsb_file_blk = etc_dir_blk + 1
+    journal_start_blk = (lsb_file_blk + 1) if has_etc_lsb else (lost_found_blk + 1)
     if journal_start_blk + journal_blocks >= min(total_blocks, BLOCKS_PER_GROUP):
         raise ValueError("Group 0 does not have enough contiguous space for ext4 metadata and journal.")
 
@@ -244,10 +320,8 @@ def format_ext4_partition(
         bmap = bytearray(BLOCK_SIZE)
         _set_bitmap_range(bmap, 0, meta_blocks)
         if g == 0:
-            # Allocate root dir (1 block), lost+found (1 block), and journal blocks.
-            extra_alloc = 2 + journal_blocks
-            _set_bitmap_range(bmap, meta_blocks, extra_alloc)
-            used_blocks = meta_blocks + extra_alloc
+            _set_bitmap_range(bmap, meta_blocks, g0_extra_blocks)
+            used_blocks = meta_blocks + g0_extra_blocks
         else:
             used_blocks = meta_blocks
 
@@ -261,11 +335,11 @@ def format_ext4_partition(
         imap = bytearray(BLOCK_SIZE)
         imap[INODES_PER_GROUP // 8 :] = b"\xff" * (BLOCK_SIZE - (INODES_PER_GROUP // 8))
         if g == 0:
-            _set_bitmap_range(imap, 0, 11)
-            free_i = INODES_PER_GROUP - 11
-            dirs = 2
+            _set_bitmap_range(imap, 0, g0_used_inodes)
+            free_i = INODES_PER_GROUP - g0_used_inodes
+            dirs = g0_dirs
             flags = 0
-            itu = INODES_PER_GROUP - 11
+            itu = INODES_PER_GROUP - g0_used_inodes
         else:
             free_i = INODES_PER_GROUP
             dirs = 0
@@ -339,7 +413,7 @@ def format_ext4_partition(
         fs_seed=fs_seed,
         mode=0o040755,
         size_bytes=BLOCK_SIZE,
-        links_count=3,
+        links_count=4 if has_etc_lsb else 3,
         blocks_512=BLOCK_SIZE // 512,
         timestamp=now,
         extent_start_block=root_dir_blk,
@@ -372,18 +446,58 @@ def format_ext4_partition(
     g0_itable_blk0[1 * INODE_SIZE : 2 * INODE_SIZE] = root_inode
     g0_itable_blk0[7 * INODE_SIZE : 8 * INODE_SIZE] = journal_inode
     g0_itable_blk0[10 * INODE_SIZE : 11 * INODE_SIZE] = lost_found_inode
+    if etc_lsb_release is not None:
+        etc_inode = _pack_inode(
+            ino=12,
+            fs_seed=fs_seed,
+            mode=0o040755,
+            size_bytes=BLOCK_SIZE,
+            links_count=2,
+            blocks_512=BLOCK_SIZE // 512,
+            timestamp=now,
+            extent_start_block=etc_dir_blk,
+            extent_block_count=1,
+        )
+        lsb_inode = _pack_inode(
+            ino=13,
+            fs_seed=fs_seed,
+            mode=0o100644,
+            size_bytes=len(etc_lsb_release),
+            links_count=1,
+            blocks_512=BLOCK_SIZE // 512,
+            timestamp=now,
+            extent_start_block=lsb_file_blk,
+            extent_block_count=1,
+        )
+        g0_itable_blk0[11 * INODE_SIZE : 12 * INODE_SIZE] = etc_inode
+        g0_itable_blk0[12 * INODE_SIZE : 13 * INODE_SIZE] = lsb_inode
+
     g0_it_blk = 1 + gdt_blocks + 2
     write_at(partition_offset + g0_it_blk * BLOCK_SIZE, g0_itable_blk0)
 
+    root_extra: tuple[tuple[int, str, int], ...] = (
+        ((11, "lost+found", 2), (12, "etc", 2)) if has_etc_lsb else ((11, "lost+found", 2),)
+    )
     root_dir_data = _build_dir_block(
         dir_ino=2,
         parent_ino=2,
         fs_seed=fs_seed,
-        extra_entries=((11, "lost+found", 2),),
+        extra_entries=root_extra,
     )
     lost_found_data = _build_dir_block(dir_ino=11, parent_ino=2, fs_seed=fs_seed)
     write_at(partition_offset + root_dir_blk * BLOCK_SIZE, root_dir_data)
     write_at(partition_offset + lost_found_blk * BLOCK_SIZE, lost_found_data)
+    if etc_lsb_release is not None:
+        etc_dir_data = _build_dir_block(
+            dir_ino=12,
+            parent_ino=2,
+            fs_seed=fs_seed,
+            extra_entries=((13, "lsb-release", 1),),
+        )
+        lsb_blk = bytearray(BLOCK_SIZE)
+        lsb_blk[: len(etc_lsb_release)] = etc_lsb_release
+        write_at(partition_offset + etc_dir_blk * BLOCK_SIZE, etc_dir_data)
+        write_at(partition_offset + lsb_file_blk * BLOCK_SIZE, lsb_blk)
 
     jsb = _build_journal_superblock(uid, journal_blocks)
     write_at(partition_offset + journal_start_blk * BLOCK_SIZE, jsb)
@@ -405,7 +519,7 @@ def format_ext4_partition(
         total_blocks & 0xFFFFFFFF,
         r_blocks_count & 0xFFFFFFFF,
         total_free_blocks & 0xFFFFFFFF,
-        (inodes_count - 11) & 0xFFFFFFFF,
+        (inodes_count - g0_used_inodes) & 0xFFFFFFFF,
         0,  # s_first_data_block
         2,  # s_log_block_size (4096)
         2,  # s_log_cluster_size

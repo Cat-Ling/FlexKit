@@ -700,14 +700,16 @@ class FlexKitWindow(QtWidgets.QMainWindow):
                 return
             mode = self.drive_page.install_mode()
             install_flexshim = self.drive_page.install_flexshim_checked()
-            block_updates = self.drive_page.block_updates_checked()
+            cros_debug = self.drive_page.cros_debug_checked()
+            disable_updates = self.drive_page.disable_updates_checked()
             if confirm_write_dialog(
                 self,
                 self._prepared,
                 drv,
                 install_mode=mode,
                 install_flexshim=install_flexshim,
-                block_updates=block_updates,
+                cros_debug=cros_debug,
+                disable_updates=disable_updates,
             ):
                 self._target_drive = drv
                 self._start_write(drv)
@@ -847,7 +849,8 @@ class FlexKitWindow(QtWidgets.QMainWindow):
             verify_drive=verify_drive,
             install_mode=mode,
             install_flexshim=self.drive_page.install_flexshim_checked(),
-            block_updates=self.drive_page.block_updates_checked(),
+            cros_debug=self.drive_page.cros_debug_checked(),
+            disable_updates=self.drive_page.disable_updates_checked(),
         )
         self.progress_page.reset_indeterminate()
         self._go_to(Step.WRITING)

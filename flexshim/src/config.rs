@@ -9,7 +9,7 @@ const CROS_DEBUG_TOKEN: &[u8] = b"cros_debug";
 
 #[derive(Copy, Clone)]
 pub struct Config {
-    pub block_updates: bool,
+    pub cros_debug: bool,
     extra_len: usize,
     extra_cmdline: [u8; MAX_EXTRA_CMDLINE_BYTES],
     pub warnings: u32,
@@ -18,7 +18,7 @@ pub struct Config {
 impl Config {
     pub const fn new() -> Self {
         Self {
-            block_updates: false,
+            cros_debug: false,
             extra_len: 0,
             extra_cmdline: [0; MAX_EXTRA_CMDLINE_BYTES],
             warnings: 0,
@@ -30,7 +30,7 @@ impl Config {
     }
 
     pub fn has_cmdline_additions(&self) -> bool {
-        self.block_updates || self.extra_len > 0
+        self.cros_debug || self.extra_len > 0
     }
 
     pub fn parse(raw: &[u8]) -> Self {
@@ -51,17 +51,17 @@ impl Config {
             let key = trim_ascii_ws(&line[..eq_idx]);
             let val = trim_ascii_ws(&line[eq_idx + 1..]);
 
-            if key == b"block_updates" {
+            if key == b"cros_debug" {
                 if eq_ignore_ascii_case(val, b"true")
                     || val == b"1"
                     || eq_ignore_ascii_case(val, b"yes")
                 {
-                    cfg.block_updates = true;
+                    cfg.cros_debug = true;
                 } else if eq_ignore_ascii_case(val, b"false")
                     || val == b"0"
                     || eq_ignore_ascii_case(val, b"no")
                 {
-                    cfg.block_updates = false;
+                    cfg.cros_debug = false;
                 } else {
                     cfg.warnings = cfg.warnings.saturating_add(1);
                 }
@@ -274,7 +274,7 @@ pub fn build_merged_cmdline(existing_utf16: &[u16], cfg: &Config, out: &mut [u16
         }
     }
 
-    if cfg.block_updates && !contains_ascii_token(&out[..pos], CROS_DEBUG_TOKEN) {
+    if cfg.cros_debug && !contains_ascii_token(&out[..pos], CROS_DEBUG_TOKEN) {
         if !append_ascii_token(out, &mut pos, CROS_DEBUG_TOKEN) {
             return None;
         }
@@ -315,11 +315,11 @@ mod tests {
     #[test]
     fn commented_default_config_has_no_additions() {
         let raw = b"\
-# block_updates=true\n\
+# cros_debug=true\n\
 # extra_cmdline=i8042.nomux\n\
 ";
         let cfg = Config::parse(raw);
-        assert!(!cfg.block_updates);
+        assert!(!cfg.cros_debug);
         assert!(cfg.extra_cmdline().is_empty());
         assert!(!cfg.has_cmdline_additions());
         assert_eq!(cfg.warnings, 0);
@@ -328,10 +328,10 @@ mod tests {
     #[test]
     fn parses_bom_crlf_whitespace_and_values() {
         let mut raw = [0u8; 128];
-        let body = b"\xEF\xBB\xBF  block_updates = YES \r\n\t# comment\r\n extra_cmdline =  i8042.nomux   i915.enable_psr=0 \r\n";
+        let body = b"\xEF\xBB\xBF  cros_debug = YES \r\n\t# comment\r\n extra_cmdline =  i8042.nomux   i915.enable_psr=0 \r\n";
         raw[..body.len()].copy_from_slice(body);
         let cfg = Config::parse(&raw[..body.len()]);
-        assert!(cfg.block_updates);
+        assert!(cfg.cros_debug);
         assert_eq!(cfg.extra_cmdline(), b"i8042.nomux i915.enable_psr=0");
         assert!(cfg.has_cmdline_additions());
         assert_eq!(cfg.warnings, 0);
@@ -339,9 +339,9 @@ mod tests {
 
     #[test]
     fn unknown_keys_and_bad_values_increment_warnings() {
-        let raw = b"missing_equals\nunknown_key=1\nblock_updates=maybe\nblock_updates=true\nextra_cmdline=ok_flag bad\x01flag next_flag\n";
+        let raw = b"missing_equals\nunknown_key=1\ncros_debug=maybe\ncros_debug=true\nextra_cmdline=ok_flag bad\x01flag next_flag\n";
         let cfg = Config::parse(raw);
-        assert!(cfg.block_updates);
+        assert!(cfg.cros_debug);
         assert_eq!(cfg.extra_cmdline(), b"ok_flag next_flag");
         assert_eq!(cfg.warnings, 4);
     }
@@ -350,7 +350,7 @@ mod tests {
     fn merge_strips_nul_appends_flags_and_dedups_cros_debug() {
         let base_buf = to_utf16_with_nul("quiet cros_efi   ");
         let base_len = "quiet cros_efi   ".len() + 1;
-        let cfg = Config::parse(b"block_updates=true\nextra_cmdline=cros_debug i8042.nomux\n");
+        let cfg = Config::parse(b"cros_debug=true\nextra_cmdline=cros_debug i8042.nomux\n");
 
         let mut out = [0xFFFFu16; 128];
         let merged_len = build_merged_cmdline(&base_buf[..base_len], &cfg, &mut out).unwrap();

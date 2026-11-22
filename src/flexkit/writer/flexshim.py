@@ -16,7 +16,7 @@ _ATTR_ARCHIVE = 0x20
 _ATTR_LFN = 0x0F
 _DOS_DEFAULT_TIME = 0x0000
 _DOS_DEFAULT_DATE = 0x5C21  # 2026-01-01
-_BLOCK_UPDATES_RE = re.compile(r"^\s*#?\s*block_updates\s*=")
+_CROS_DEBUG_RE = re.compile(r"^\s*#?\s*cros_debug\s*=")
 _VALID_83_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'()-@^_`{}~")
 
 
@@ -63,21 +63,21 @@ def load_flexshim_cfg_template() -> str:
     raise WriteError("Bundled flexshim.cfg template not found.")
 
 
-def render_flexshim_cfg(*, block_updates: bool, template: str | None = None) -> bytes:
+def render_flexshim_cfg(*, cros_debug: bool, template: str | None = None) -> bytes:
     src = template if template is not None else load_flexshim_cfg_template()
-    target_line = "block_updates=true" if block_updates else "# block_updates=true"
+    target_line = "cros_debug=true" if cros_debug else "# cros_debug=true"
     out_lines: list[str] = []
     replaced = False
 
     for line in src.splitlines():
-        if _BLOCK_UPDATES_RE.match(line):
+        if _CROS_DEBUG_RE.match(line):
             if not replaced:
                 out_lines.append(target_line)
                 replaced = True
         else:
             out_lines.append(line)
 
-    if not replaced and block_updates:
+    if not replaced and cros_debug:
         out_lines.append(target_line)
 
     return ("\n".join(out_lines) + "\n").encode("utf-8")
@@ -544,12 +544,12 @@ def install_flexshim_to_esp(
     esp_offset: int,
     esp_size: int,
     *,
-    block_updates: bool = False,
+    cros_debug: bool = False,
     efi_bytes: bytes | None = None,
     cfg_bytes: bytes | None = None,
 ) -> tuple[bytes, bytes]:
     efi = efi_bytes if efi_bytes is not None else load_flexshim_efi()
-    cfg = cfg_bytes if cfg_bytes is not None else render_flexshim_cfg(block_updates=block_updates)
+    cfg = cfg_bytes if cfg_bytes is not None else render_flexshim_cfg(cros_debug=cros_debug)
 
     vol = _FatVolume(io, esp_offset, esp_size)
     if vol.read_file(("efi", "boot", "crdybootx64.efi")) is None:

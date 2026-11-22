@@ -147,7 +147,8 @@ def write_block_device(
             install_mode=spec.install_mode,
             expected_size=spec.expected_size,
             install_flexshim=spec.install_flexshim,
-            block_updates=spec.block_updates,
+            cros_debug=spec.cros_debug,
+            disable_updates=spec.disable_updates,
         )
     finally:
         logger.info("Closing block device fd=%d", wfd)

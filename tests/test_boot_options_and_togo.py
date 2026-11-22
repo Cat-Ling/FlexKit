@@ -16,11 +16,12 @@ import zipfile
 import pytest
 
 from flexkit.writer import (
+    DISABLE_UPDATES_LSB_RELEASE,
     WriteError,
     stream_zip_to_fd,
     write_image_to_block_io,
 )
-from flexkit.writer.ext4 import format_ext4_partition
+from flexkit.writer.ext4 import format_ext4_partition, verify_ext4_etc_lsb_release
 from flexkit.writer.flexshim import (
     install_flexshim_to_esp,
     load_flexshim_efi,
@@ -293,6 +294,55 @@ def test_ext4_format_passes_e2fsck(tmp_path: Path) -> None:
     assert "Filesystem volume name:   H-STATE" in dump
     for feat in ("has_journal", "encrypt", "verity", "metadata_csum", "64bit", "extent"):
         assert feat in dump
+
+
+def test_ext4_format_with_etc_lsb_release_passes_e2fsck_and_debugfs(tmp_path: Path) -> None:
+    e2fsck = _find_sys_tool("e2fsck")
+    debugfs = _find_sys_tool("debugfs")
+    if e2fsck is None:
+        pytest.skip("e2fsck not installed")
+
+    with pytest.raises(ValueError, match="etc_lsb_release"):
+        format_ext4_partition(lambda _o, _d: None, 0, 256 * 1024 * 1024, etc_lsb_release=b"")
+
+    img = tmp_path / "hstate_lsb.img"
+    size_bytes = 256 * 1024 * 1024
+    fd = os.open(img, os.O_RDWR | os.O_CREAT | os.O_TRUNC | _O_BIN, 0o600)
+    try:
+        os.ftruncate(fd, size_bytes)
+        format_ext4_partition(
+            lambda off, d: _fd_pwrite(fd, d, off),
+            0,
+            size_bytes,
+            label="H-STATE",
+            etc_lsb_release=DISABLE_UPDATES_LSB_RELEASE,
+        )
+        os.fsync(fd)
+        verify_ext4_etc_lsb_release(lambda off, n: _fd_pread(fd, n, off), 0, DISABLE_UPDATES_LSB_RELEASE)
+    finally:
+        os.close(fd)
+
+    chk = subprocess.run([e2fsck, "-fn", str(img)], capture_output=True, text=True)
+    assert chk.returncode == 0, f"e2fsck failed with /etc/lsb-release: {chk.stdout}\n{chk.stderr}"
+
+    if debugfs is not None:
+        cat_res = subprocess.run([debugfs, "-R", "cat /etc/lsb-release", str(img)], capture_output=True)
+        assert cat_res.returncode == 0
+        assert cat_res.stdout == DISABLE_UPDATES_LSB_RELEASE
+
+        stat_res = subprocess.run([debugfs, "-R", "stat /etc/lsb-release", str(img)], capture_output=True, text=True)
+        assert stat_res.returncode == 0
+        assert "Type: regular" in stat_res.stdout
+        assert "0644" in stat_res.stdout
+
+    fd = os.open(img, os.O_RDWR | _O_BIN)
+    try:
+        with pytest.raises(ValueError, match="size mismatch"):
+            verify_ext4_etc_lsb_release(lambda off, n: _fd_pread(fd, n, off), 0, b"CHROMEOS_RELEASE_VERSION=1.0.0\n")
+        with pytest.raises(ValueError, match="contents"):
+            verify_ext4_etc_lsb_release(lambda off, n: _fd_pread(fd, n, off), 0, b"CHROMEOS_RELEASE_VERSION=12345.0.0\n")
+    finally:
+        os.close(fd)
 
 
 def test_plan_chromeos_togo_layout_matches_write_base_table() -> None:
@@ -615,18 +665,18 @@ def test_stream_zip_to_fd_skip_verify(tmp_path: Path) -> None:
         assert f.read() == data
 
 
-def test_render_flexshim_cfg_toggles_block_updates() -> None:
-    disabled = render_flexshim_cfg(block_updates=False).decode("utf-8")
-    assert "# block_updates=true" in disabled
-    assert "\nblock_updates=true\n" not in f"\n{disabled}"
+def test_render_flexshim_cfg_toggles_cros_debug() -> None:
+    disabled = render_flexshim_cfg(cros_debug=False).decode("utf-8")
+    assert "# cros_debug=true" in disabled
+    assert "\ncros_debug=true\n" not in f"\n{disabled}"
 
-    enabled = render_flexshim_cfg(block_updates=True).decode("utf-8")
-    assert "\nblock_updates=true\n" in f"\n{enabled}"
+    enabled = render_flexshim_cfg(cros_debug=True).decode("utf-8")
+    assert "\ncros_debug=true\n" in f"\n{enabled}"
     assert "flexshim configuration file" in enabled
 
-    re_disabled = render_flexshim_cfg(block_updates=False, template=enabled).decode("utf-8")
-    assert "# block_updates=true" in re_disabled
-    assert "\nblock_updates=true\n" not in f"\n{re_disabled}"
+    re_disabled = render_flexshim_cfg(cros_debug=False, template=enabled).decode("utf-8")
+    assert "# cros_debug=true" in re_disabled
+    assert "\ncros_debug=true\n" not in f"\n{re_disabled}"
 
 
 def test_install_flexshim_on_fat16_and_fat32_esp(tmp_path: Path) -> None:
@@ -637,13 +687,13 @@ def test_install_flexshim_on_fat16_and_fat32_esp(tmp_path: Path) -> None:
     esp_io = _SparseMemoryBlockIO(len(raw_esp))
     esp_io.write_at(0, raw_esp)
 
-    installed_efi, installed_cfg = install_flexshim_to_esp(esp_io, 0, len(raw_esp), block_updates=False)
+    installed_efi, installed_cfg = install_flexshim_to_esp(esp_io, 0, len(raw_esp), cros_debug=False)
     assert installed_efi == efi_bin
-    assert b"# block_updates=true" in installed_cfg
+    assert b"# cros_debug=true" in installed_cfg
     verify_flexshim_on_esp(esp_io, 0, len(raw_esp), installed_efi, installed_cfg)
 
-    updated_efi, updated_cfg = install_flexshim_to_esp(esp_io, 0, len(raw_esp), block_updates=True)
-    assert b"\nblock_updates=true\n" in b"\n" + updated_cfg
+    updated_efi, updated_cfg = install_flexshim_to_esp(esp_io, 0, len(raw_esp), cros_debug=True)
+    assert b"\ncros_debug=true\n" in b"\n" + updated_cfg
     verify_flexshim_on_esp(esp_io, 0, len(raw_esp), updated_efi, updated_cfg)
 
     no_crdy_esp = _build_minimal_fat16_esp().replace(b"crdybootx64.efi", b"otherboot64.efi")
@@ -654,7 +704,7 @@ def test_install_flexshim_on_fat16_and_fat32_esp(tmp_path: Path) -> None:
     no_crdy_buf[crdy_clus_off + 96 : crdy_clus_off + 192] = b"\x00" * 96
     no_crdy_io.write_at(0, no_crdy_buf)
     with pytest.raises(WriteError, match="crdybootx64.efi"):
-        install_flexshim_to_esp(no_crdy_io, 0, len(no_crdy_buf), block_updates=False)
+        install_flexshim_to_esp(no_crdy_io, 0, len(no_crdy_buf), cros_debug=False)
 
     mkfs = _find_sys_tool("mkfs.vfat")
     mmd = _find_sys_tool("mmd")
@@ -676,7 +726,7 @@ def test_install_flexshim_on_fat16_and_fat32_esp(tmp_path: Path) -> None:
 
             mem = _SparseMemoryBlockIO(esp_bytes)
             mem.write_at(0, esp_path.read_bytes())
-            got_efi, got_cfg = install_flexshim_to_esp(mem, 0, esp_bytes, block_updates=True)
+            got_efi, got_cfg = install_flexshim_to_esp(mem, 0, esp_bytes, cros_debug=True)
             verify_flexshim_on_esp(mem, 0, esp_bytes, got_efi, got_cfg)
             esp_path.write_bytes(mem.read_at(0, esp_bytes))
 
@@ -707,6 +757,19 @@ def test_installer_and_togo_stream_with_flexshim(tmp_path: Path) -> None:
     )
 
     inst_io = _SparseMemoryBlockIO(img_size)
+    with pytest.raises(WriteError, match="ChromeOS To Go fresh"):
+        write_image_to_block_io(
+            archive_path=zip_path,
+            member_name="chromeos.bin",
+            image_size=img_size,
+            expected_sha1="",
+            io=inst_io,
+            verify_drive=False,
+            install_mode="installer",
+            expected_size=img_size,
+            disable_updates=True,
+        )
+
     write_image_to_block_io(
         archive_path=zip_path,
         member_name="chromeos.bin",
@@ -717,14 +780,14 @@ def test_installer_and_togo_stream_with_flexshim(tmp_path: Path) -> None:
         install_mode="installer",
         expected_size=img_size,
         install_flexshim=True,
-        block_updates=True,
+        cros_debug=True,
     )
     inst_gpt = read_gpt_table_from_bytes(inst_io.read_at(0, 34 * SECTOR_SIZE))
     assert inst_gpt is not None
     inst_efi = inst_gpt.get_by_name("EFI-SYSTEM")
     assert inst_efi is not None
     expected_efi = load_flexshim_efi()
-    expected_cfg = render_flexshim_cfg(block_updates=True)
+    expected_cfg = render_flexshim_cfg(cros_debug=True)
     verify_flexshim_on_esp(inst_io, inst_efi.start_lba * SECTOR_SIZE, inst_efi.size_bytes, expected_efi, expected_cfg)
 
     togo_size = 12 * 1024 * 1024 * 1024
@@ -738,18 +801,39 @@ def test_installer_and_togo_stream_with_flexshim(tmp_path: Path) -> None:
         verify_drive=True,
         install_mode="to_go_fresh",
         expected_size=togo_size,
-        install_flexshim=True,
-        block_updates=True,
+        install_flexshim=False,
+        cros_debug=False,
+        disable_updates=True,
     )
     togo_gpt = read_gpt_table_from_bytes(togo_io.read_at(0, 34 * SECTOR_SIZE))
     assert togo_gpt is not None
     togo_efi = togo_gpt.get_by_name("EFI-SYSTEM")
-    assert togo_efi is not None
+    togo_state = togo_gpt.get_by_name("STATE")
+    assert togo_efi is not None and togo_state is not None
     verify_flexshim_on_esp(togo_io, togo_efi.start_lba * SECTOR_SIZE, togo_efi.size_bytes, expected_efi, expected_cfg)
+    verify_ext4_etc_lsb_release(
+        togo_io.read_at,
+        togo_state.start_lba * SECTOR_SIZE,
+        DISABLE_UPDATES_LSB_RELEASE,
+    )
+
+    with pytest.raises(WriteError, match="ChromeOS To Go fresh"):
+        write_image_to_block_io(
+            archive_path=zip_path,
+            member_name="chromeos.bin",
+            image_size=img_size,
+            expected_sha1="",
+            io=togo_io,
+            verify_drive=False,
+            install_mode="to_go_update",
+            expected_size=togo_size,
+            disable_updates=True,
+        )
 
 
 def test_drive_page_flexshim_option_coupling() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from flexkit.drives import Drive, DriveEntry
     from flexkit.ui.pages import DrivePage
     from flexkit.ui.qt import QtWidgets
 
@@ -757,18 +841,73 @@ def test_drive_page_flexshim_option_coupling() -> None:
     _ = _app
     page = DrivePage()
 
+    assert page.install_mode() == "installer"
     assert page.install_flexshim_checked() is False
-    assert page.block_updates_checked() is False
+    assert page.cros_debug_checked() is False
+    assert page.disable_updates_checked() is False
+    assert page.disable_updates_tile.isEnabled() is False
 
-    page.block_updates_tile.setChecked(True)
+    page.cros_debug_tile.setChecked(True)
     assert page.flexshim_tile.isChecked() is True
     assert page.install_flexshim_checked() is True
-    assert page.block_updates_checked() is True
+    assert page.cros_debug_checked() is True
+    assert page.disable_updates_checked() is False
 
     page.flexshim_tile.setChecked(False)
-    assert page.block_updates_tile.isChecked() is False
+    assert page.cros_debug_tile.isChecked() is False
     assert page.install_flexshim_checked() is False
-    assert page.block_updates_checked() is False
+    assert page.cros_debug_checked() is False
+
+    page.mode_dropdown.set_current_index(1)
+    assert page.install_mode() == "to_go_fresh"
+    assert page.disable_updates_tile.isEnabled() is True
+
+    page.disable_updates_tile.setChecked(True)
+    assert page.flexshim_tile.isChecked() is True
+    assert page.cros_debug_tile.isChecked() is True
+    assert page.install_flexshim_checked() is True
+    assert page.cros_debug_checked() is True
+    assert page.disable_updates_checked() is True
+
+    page.cros_debug_tile.setChecked(False)
+    assert page.disable_updates_tile.isChecked() is False
+    assert page.disable_updates_checked() is False
+    assert page.flexshim_tile.isChecked() is True
+
+    cros_drive = Drive(
+        id="/dev/sdb",
+        name="SanDisk Extreme",
+        size=64 * 1024 * 1024 * 1024,
+        bus="USB",
+        removable=True,
+        serial="SER123",
+        volumes=(),
+        system=False,
+        read_only=False,
+        has_chromeos=True,
+    )
+    page.set_entries([DriveEntry(drive=cros_drive)])
+    assert page.install_mode() == "to_go_update"
+    assert page.disable_updates_tile.isEnabled() is False
+    assert page.disable_updates_checked() is False
+
+    page.keep_data_tile.setChecked(False)
+    assert page.install_mode() == "to_go_fresh"
+    assert page.disable_updates_tile.isEnabled() is True
+    page.disable_updates_tile.setChecked(True)
+    assert page.disable_updates_checked() is True
+    assert page.cros_debug_checked() is True
+
+    page.keep_data_tile.setChecked(True)
+    assert page.install_mode() == "to_go_update"
+    assert page.disable_updates_tile.isEnabled() is False
+    assert page.disable_updates_tile.isChecked() is False
+    assert page.disable_updates_checked() is False
+    assert page.cros_debug_checked() is True
+
+    page.flexshim_tile.setChecked(False)
+    assert page.cros_debug_tile.isChecked() is False
+    assert page.install_flexshim_checked() is False
 
 
 def test_build_script_target_commands_and_icons(tmp_path: Path) -> None:

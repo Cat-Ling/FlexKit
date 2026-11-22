@@ -17,7 +17,7 @@ from typing import IO, Protocol
 import zipfile
 
 from flexkit.drives import _drive_hosts_path, enumerate_all_drives
-from flexkit.writer.ext4 import format_ext4_partition
+from flexkit.writer.ext4 import format_ext4_partition, verify_ext4_etc_lsb_release
 from flexkit.writer.gpt import (
     SECTOR_SIZE,
     GptPartition,
@@ -34,6 +34,7 @@ logger = logging.getLogger("flexkit.writer")
 WRITE_BLOCK_SIZE = 4 * 1024 * 1024
 FSYNC_INTERVAL = 32 * 1024 * 1024
 MIN_TOGO_DRIVE_SIZE = 11 * 1024 * 1024 * 1024
+DISABLE_UPDATES_LSB_RELEASE = b"CHROMEOS_RELEASE_VERSION=99999.0.0\n"
 
 WriteProgressCallback = Callable[[str, int, int, int], None]
 
@@ -151,7 +152,8 @@ class WriteSpec:
     verify_drive: bool = True
     install_mode: str = "installer"
     install_flexshim: bool = False
-    block_updates: bool = False
+    cros_debug: bool = False
+    disable_updates: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -165,7 +167,8 @@ class WriteSpec:
             "verify_drive": self.verify_drive,
             "install_mode": self.install_mode,
             "install_flexshim": self.install_flexshim,
-            "block_updates": self.block_updates,
+            "cros_debug": self.cros_debug,
+            "disable_updates": self.disable_updates,
         }
 
     @classmethod
@@ -181,7 +184,8 @@ class WriteSpec:
             verify_drive=bool(d.get("verify_drive", True)),
             install_mode=str(d.get("install_mode") or "installer"),
             install_flexshim=bool(d.get("install_flexshim", False)),
-            block_updates=bool(d.get("block_updates", False)),
+            cros_debug=bool(d.get("cros_debug", False)),
+            disable_updates=bool(d.get("disable_updates", False)),
         )
 
 
@@ -357,8 +361,11 @@ def _stream_installer_to_io(
     before_verify_hook: Callable[[], None] | None,
     verify_drive: bool,
     install_flexshim: bool = False,
-    block_updates: bool = False,
+    cros_debug: bool = False,
+    disable_updates: bool = False,
 ) -> None:
+    if disable_updates:
+        raise WriteError("Disabling ChromeOS updates is only supported for ChromeOS To Go fresh installs.")
     write_sha1 = hashlib.sha1()
     written = 0
     since_sync = 0
@@ -470,7 +477,7 @@ def _stream_installer_to_io(
     else:
         logger.info("Verification skipped by user option.")
 
-    if install_flexshim or block_updates:
+    if install_flexshim or cros_debug:
         from flexkit.writer.flexshim import install_flexshim_to_esp, verify_flexshim_on_esp
 
         hdr_buf = io.read_at(0, 34 * SECTOR_SIZE)
@@ -482,8 +489,8 @@ def _stream_installer_to_io(
             raise WriteError("Missing EFI-SYSTEM partition for flexshim installation.")
         esp_offset = efi_part.start_lba * SECTOR_SIZE
         esp_size = efi_part.size_bytes
-        logger.info("Installing flexshim into EFI-SYSTEM at offset %d (block_updates=%s)...", esp_offset, block_updates)
-        efi_bytes, cfg_bytes = install_flexshim_to_esp(io, esp_offset, esp_size, block_updates=block_updates)
+        logger.info("Installing flexshim into EFI-SYSTEM at offset %d (cros_debug=%s)...", esp_offset, cros_debug)
+        efi_bytes, cfg_bytes = install_flexshim_to_esp(io, esp_offset, esp_size, cros_debug=cros_debug)
         io.flush()
         if verify_drive:
             if before_verify_hook is not None:
@@ -507,8 +514,14 @@ def _stream_togo_to_io(
     before_verify_hook: Callable[[], None] | None,
     verify_drive: bool,
     install_flexshim: bool = False,
-    block_updates: bool = False,
+    cros_debug: bool = False,
+    disable_updates: bool = False,
 ) -> None:
+    if disable_updates and install_mode != "to_go_fresh":
+        raise WriteError("Disabling ChromeOS updates is only supported for ChromeOS To Go fresh installs.")
+    effective_cros_debug = cros_debug or disable_updates
+    effective_flexshim = install_flexshim or effective_cros_debug
+
     disk_bytes = expected_size if expected_size > 0 else io.size
     total_sectors = disk_bytes // SECTOR_SIZE
     if total_sectors < 1000:
@@ -637,15 +650,17 @@ def _stream_togo_to_io(
 
     if install_mode == "to_go_fresh":
         logger.info(
-            "Formatting STATE (H-STATE ext4) at LBA %d (%d bytes)...",
+            "Formatting STATE (H-STATE ext4) at LBA %d (%d bytes, disable_updates=%s)...",
             dst_state.start_lba,
             dst_state.size_bytes,
+            disable_updates,
         )
         format_ext4_partition(
             io.write_at,
             dst_state.start_lba * SECTOR_SIZE,
             dst_state.size_bytes,
             label="H-STATE",
+            etc_lsb_release=DISABLE_UPDATES_LSB_RELEASE if disable_updates else None,
         )
     else:
         # Commit updated GPT & MBR after OS partitions are written.
@@ -659,13 +674,13 @@ def _stream_togo_to_io(
     if progress_cb is not None:
         progress_cb("write", total_write_bytes, total_write_bytes, bps)
 
-    if install_flexshim or block_updates:
+    if effective_flexshim:
         from flexkit.writer.flexshim import install_flexshim_to_esp, verify_flexshim_on_esp
 
         esp_offset = dst_efi.start_lba * SECTOR_SIZE
         esp_size = dst_efi.size_bytes
-        logger.info("Installing flexshim into To Go EFI-SYSTEM at offset %d (block_updates=%s)...", esp_offset, block_updates)
-        efi_bytes, cfg_bytes = install_flexshim_to_esp(io, esp_offset, esp_size, block_updates=block_updates)
+        logger.info("Installing flexshim into To Go EFI-SYSTEM at offset %d (cros_debug=%s)...", esp_offset, effective_cros_debug)
+        efi_bytes, cfg_bytes = install_flexshim_to_esp(io, esp_offset, esp_size, cros_debug=effective_cros_debug)
         io.flush()
     else:
         efi_bytes = b""
@@ -694,9 +709,15 @@ def _stream_togo_to_io(
         raise WriteError("Verification failed: backup GPT header mismatch.")
 
     if install_mode == "to_go_fresh":
-        state_sb = io.read_at(dst_state.start_lba * SECTOR_SIZE + 1024, 1024)
+        state_off = dst_state.start_lba * SECTOR_SIZE
+        state_sb = io.read_at(state_off + 1024, 1024)
         if state_sb[0x38:0x3A] != b"\x53\xef":
             raise WriteError("Verification failed: H-STATE ext4 superblock magic missing.")
+        if disable_updates:
+            try:
+                verify_ext4_etc_lsb_release(io.read_at, state_off, DISABLE_UPDATES_LSB_RELEASE)
+            except ValueError as exc:
+                raise WriteError(f"Verification failed: {exc}") from exc
 
     total_verify_bytes = total_write_bytes
     checked = 0
@@ -710,7 +731,7 @@ def _stream_togo_to_io(
     for op, expected_op_sha1 in zip(copy_ops, op_sha1s, strict=True):
         verify_len = op.length
         # flexshim updates /efi/boot files inside EFI-SYSTEM; verify unmodified region separately below if needed.
-        if (install_flexshim or block_updates) and op.name == "EFI-SYSTEM":
+        if effective_flexshim and op.name == "EFI-SYSTEM":
             checked += op.length * len(op.dst_offsets)
             continue
         for dst_base in op.dst_offsets:
@@ -749,7 +770,7 @@ def _stream_togo_to_io(
             if v_hash.hexdigest().lower() != expected_op_sha1:
                 raise WriteError(f"Verification failed: data read back from {op.name} did not match source SHA-1.")
 
-    if install_flexshim or block_updates:
+    if effective_flexshim:
         verify_flexshim_on_esp(io, dst_efi.start_lba * SECTOR_SIZE, dst_efi.size_bytes, efi_bytes, cfg_bytes)
 
     logger.info("ChromeOS To Go drive verification successful!")
@@ -769,16 +790,18 @@ def write_image_to_block_io(
     install_mode: str = "installer",
     expected_size: int = 0,
     install_flexshim: bool = False,
-    block_updates: bool = False,
+    cros_debug: bool = False,
+    disable_updates: bool = False,
 ) -> None:
     logger.info(
-        "Starting write_image_to_block_io: image_size=%d, expected_size=%d, mode=%s, verify=%s, flexshim=%s, block_updates=%s, sha1=%s",
+        "Starting write_image_to_block_io: image_size=%d, expected_size=%d, mode=%s, verify=%s, flexshim=%s, cros_debug=%s, disable_updates=%s, sha1=%s",
         image_size,
         expected_size,
         install_mode,
         verify_drive,
         install_flexshim,
-        block_updates,
+        cros_debug,
+        disable_updates,
         expected_sha1,
     )
     if install_mode in ("to_go_fresh", "to_go_update"):
@@ -794,7 +817,8 @@ def write_image_to_block_io(
             before_verify_hook=before_verify_hook,
             verify_drive=verify_drive,
             install_flexshim=install_flexshim,
-            block_updates=block_updates,
+            cros_debug=cros_debug,
+            disable_updates=disable_updates,
         )
         return
 
@@ -809,7 +833,8 @@ def write_image_to_block_io(
         before_verify_hook=before_verify_hook,
         verify_drive=verify_drive,
         install_flexshim=install_flexshim,
-        block_updates=block_updates,
+        cros_debug=cros_debug,
+        disable_updates=disable_updates,
     )
 
 
@@ -828,7 +853,8 @@ def stream_zip_to_fd(
     install_mode: str = "installer",
     expected_size: int = 0,
     install_flexshim: bool = False,
-    block_updates: bool = False,
+    cros_debug: bool = False,
+    disable_updates: bool = False,
 ) -> None:
     disk_bytes = expected_size if expected_size > 0 else os.lseek(write_fd, 0, os.SEEK_END)
     io = PosixBlockIO(write_fd, disk_bytes, open_read_fd=open_read_fd)
@@ -846,7 +872,8 @@ def stream_zip_to_fd(
             install_mode=install_mode,
             expected_size=disk_bytes,
             install_flexshim=install_flexshim,
-            block_updates=block_updates,
+            cros_debug=cros_debug,
+            disable_updates=disable_updates,
         )
     finally:
         io.close_read_fd()

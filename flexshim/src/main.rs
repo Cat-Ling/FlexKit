@@ -28,11 +28,11 @@ mod efi_entry {
         }
 
         let cfg = unsafe { load_config(image_handle, system_table) };
-        if cfg.block_updates {
+        if cfg.cros_debug {
             unsafe {
                 write_console(
                     system_table,
-                    "flexshim: config block_updates=true (appending cros_debug)\n",
+                    "flexshim: config cros_debug=true (appending cros_debug)\n",
                 );
             }
         }

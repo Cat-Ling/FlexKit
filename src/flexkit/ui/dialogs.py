@@ -104,7 +104,8 @@ def confirm_write_dialog(
     install_mode: str = "installer",
     *,
     install_flexshim: bool = False,
-    block_updates: bool = False,
+    cros_debug: bool = False,
+    disable_updates: bool = False,
 ) -> bool:
     sheet = ScrimSheet(host)
     lay = sheet.card_layout
@@ -158,13 +159,15 @@ def confirm_write_dialog(
         img_desc = f"ChromeOS Flex {image.version} ({image.channel.label})"
     add_row(2, "Image", img_desc)
 
-    if install_flexshim or block_updates:
-        shim_desc = (
-            "flexshim (UEFI panic fix) · Automatic updates disabled"
-            if block_updates
-            else "flexshim (UEFI panic fix)"
-        )
-        add_row(3, "Boot shim", shim_desc)
+    effective_cros_debug = cros_debug or disable_updates
+    effective_flexshim = install_flexshim or effective_cros_debug
+    if effective_flexshim:
+        boot_parts = ["flexshim (UEFI panic fix)"]
+        if effective_cros_debug:
+            boot_parts.append("cros_debug")
+        if disable_updates:
+            boot_parts.append("Updates disabled (stateful lsb-release)")
+        add_row(3, "Boot options", " · ".join(boot_parts))
 
     info_grid.setColumnStretch(1, 1)
     lay.addWidget(info_box)
@@ -174,7 +177,7 @@ def confirm_write_dialog(
         hdd_warn.show_message("This is a USB hard drive, not a flash drive.")
         lay.addWidget(hdd_warn)
 
-    if install_flexshim or block_updates:
+    if effective_flexshim:
         shim_warn = Banner("warning", sheet.card)
         shim_warn.show_message("flexshim is unsigned — disable UEFI Secure Boot on the target PC before booting.")
         lay.addWidget(shim_warn)

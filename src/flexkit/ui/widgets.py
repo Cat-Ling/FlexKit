@@ -4,7 +4,7 @@ from pathlib import Path
 
 from flexkit.drives import DriveEntry
 from flexkit.ui import theme
-from flexkit.ui.qt import QPoint, QPointF, QRectF, QSize, QTimer, Qt, QtGui, QtWidgets, Signal
+from flexkit.ui.qt import QPoint, QPointF, QRectF, QSize, QTimer, Qt, QtCore, QtGui, QtWidgets, Signal
 
 
 class BadgeIcon(QtWidgets.QWidget):
@@ -369,7 +369,7 @@ class MaterialCheckbox(QtWidgets.QAbstractButton):
             p.drawRoundedRect(box, 4.0, 4.0)
             theme.draw_glyph(p, "check", box.adjusted(1.5, 1.5, -1.5, -1.5), theme.ON_PRIMARY, stroke_width=2.2)
         else:
-            p.setPen(QtGui.QPen(theme.color(theme.ON_SURFACE_VARIANT), 1.8))
+            p.setPen(QtGui.QPen(theme.color(theme.ON_SURFACE_VARIANT if self.isEnabled() else theme.OUTLINE_VARIANT), 1.8))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRoundedRect(box, 4.0, 4.0)
 
@@ -434,14 +434,33 @@ class BootOptionTile(QtWidgets.QFrame):
         self.checkbox.setChecked(checked)
         self.update()
 
+    def set_description(self, description: str) -> None:
+        self.desc_lbl.setText(description)
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:
+        if event.type() == QtCore.QEvent.Type.EnabledChange:
+            enabled = self.isEnabled()
+            if not enabled:
+                self._hovered = False
+            self.setCursor(Qt.CursorShape.PointingHandCursor if enabled else Qt.CursorShape.ArrowCursor)
+            self.title_lbl.setStyleSheet(
+                f"color: {theme.ON_SURFACE if enabled else theme.OUTLINE}; background: transparent;"
+            )
+            self.desc_lbl.setStyleSheet(
+                f"color: {theme.ON_SURFACE_VARIANT if enabled else theme.OUTLINE}; background: transparent;"
+            )
+            self.update()
+        super().changeEvent(event)
+
     def _on_cb_toggled(self, checked: bool) -> None:
         self._checked = checked
         self.update()
         self.toggled.emit(checked)
 
     def enterEvent(self, event: QtGui.QEnterEvent) -> None:
-        self._hovered = True
-        self.update()
+        if self.isEnabled():
+            self._hovered = True
+            self.update()
         super().enterEvent(event)
 
     def leaveEvent(self, event: QtGui.QEvent) -> None:
@@ -450,12 +469,12 @@ class BootOptionTile(QtWidgets.QFrame):
         super().leaveEvent(event)
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
+        if self.isEnabled() and event.button() == Qt.MouseButton.LeftButton:
             self.checkbox.toggle()
         super().mousePressEvent(event)
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
-        if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+        if self.isEnabled() and event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self.checkbox.toggle()
             return
         super().keyPressEvent(event)
@@ -463,7 +482,7 @@ class BootOptionTile(QtWidgets.QFrame):
     def paintEvent(self, _event: QtGui.QPaintEvent) -> None:
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        if self._hovered or self.hasFocus():
+        if self.isEnabled() and (self._hovered or self.hasFocus()):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(theme.color(theme.SURFACE_CONTAINER_HIGH if self._hovered else theme.SURFACE_CONTAINER))
             p.drawRoundedRect(QRectF(0, 0, self.width(), self.height()), 8.0, 8.0)

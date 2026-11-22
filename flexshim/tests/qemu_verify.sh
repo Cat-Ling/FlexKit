@@ -249,7 +249,7 @@ cp "$OVMF_VARS" "$TMPDIR/vars4.fd"
 mcopy -o -i "$TMPDIR/case4.img@@$ESP_BYTE_OFFSET" "$FAULT_INJ_EFI" "::/efi/boot/bootx64.efi"
 mcopy -o -i "$TMPDIR/case4.img@@$ESP_BYTE_OFFSET" "$FLEXSHIM_EFI" "::/efi/boot/nextx64.efi"
 cat > "$TMPDIR/active_flexshim.cfg" <<'CFG'
-block_updates=true
+cros_debug=true
 extra_cmdline=i8042.nomux i915.enable_psr=0
 CFG
 mcopy -o -i "$TMPDIR/case4.img@@$ESP_BYTE_OFFSET" "$TMPDIR/active_flexshim.cfg" "::/efi/boot/flexshim.cfg"
@@ -261,7 +261,7 @@ run_qemu_until "$TMPDIR/case4.log" "FAULT_INJ: RT_RESTORE_" \
     -device "virtio-blk-pci,drive=d0,bootindex=0"
 
 for required in \
-    "flexshim: config block_updates=true" \
+    "flexshim: config cros_debug=true" \
     "flexshim: config extra_cmdline enabled" \
     "flexshim: applied boot options from flexshim.cfg" \
     "FAULT_INJ: KERNEL_LOAD_OPTIONS=" \

@@ -88,12 +88,15 @@ Place `flexshim.cfg` in the same directory as `flexshimx64.efi`. If the file is
 absent or all options are commented out, `flexshimx64.efi` leaves the `vboot`
 kernel command line unmodified.
 
-- `block_updates=true`: Appends `cros_debug` to the kernel command line.
-  `update_engine` treats the booted image as a non-official debug build and
-  blocks periodic background updates without wiping stateful user data. Side
-  effects: enables `crosh` `shell` / VT2, leaves manual update checks in Settings
-  enabled (unless `CHROMEOS_AUSERVER` is overridden in stateful `lsb-release`),
-  and may restrict strict DRM playback such as HD Widevine.
+- `cros_debug=true`: Appends `cros_debug` to the kernel command line. Enables
+  ChromeOS developer features (`crosh` `shell`, VT2 root console via
+  `Ctrl+Alt+F2`), lets `update_engine` honor stateful
+  `/mnt/stateful_partition/etc/lsb-release` overrides, and blocks periodic
+  background update checks without wiping stateful user data. Side effects: may
+  restrict strict DRM playback such as HD Widevine. Note that `cros_debug` alone
+  does not block OOBE setup or manual Settings update checks; pair it with
+  `CHROMEOS_RELEASE_VERSION=99999.0.0` in `/mnt/stateful_partition/etc/lsb-release`
+  to cleanly suppress all update checks.
 - `extra_cmdline=...`: Space-separated Linux kernel parameters appended to the
   `vboot` command line (for example `i8042.nomux i915.enable_psr=0`).
 
